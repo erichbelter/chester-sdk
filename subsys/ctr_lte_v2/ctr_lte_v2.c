@@ -92,6 +92,10 @@ K_MUTEX_DEFINE(m_event_rb_lock);
  * atomic, so this uses a plain unused low index instead. */
 #define FLAG_MEASUREMENT_MODE 5
 atomic_t m_flag = ATOMIC_INIT(0);
+/* The BIT()-valued flags above are used as indices 1,2,4,8,16; 5 is free. Any
+ * future flag must also be an unused index < 32 (a BIT(5) here would index bit
+ * 32 and run off the end of the atomic). */
+BUILD_ASSERT(FLAG_MEASUREMENT_MODE < 32, "flag must be a valid atomic bit index");
 
 #define CONNECTED_BIT      BIT(0)
 #define SEND_RECV_DONE_BIT BIT(1)
@@ -546,6 +550,16 @@ int ctr_lte_v2_enable(void)
 
 int ctr_lte_v2_reconnect(void)
 {
+	/* Refuse while a survey owns the modem: this transitions the FSM from the
+	 * CALLER's thread (e.g. the `lte reconnect` shell command), which would
+	 * tear the link down under an in-flight measurement and violate the
+	 * single-owner-bus invariant. ctr_lte_v2_measure()'s own exit path clears
+	 * the flag before calling this, so it is unaffected. */
+	if (atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE)) {
+		LOG_WRN("Reconnect refused: measurement mode active");
+		return -EBUSY;
+	}
+
 	if (g_ctr_lte_v2_config.test) {
 		LOG_WRN("LTE Test mode enabled");
 		return -ENOTSUP;
@@ -570,13 +584,23 @@ int ctr_lte_v2_reconnect(void)
 	return 0;
 }
 
-/* Hard-cap watchdog for measurement mode. The timer fires from the system clock
- * ISR, so it still runs if the LTE work queue is wedged — this is the backstop
- * that guarantees the FSM can never stay quiesced (and the modem unreachable)
- * forever because a survey callback failed to return. */
+/* Hard cap for measurement mode. The timer fires from the system clock ISR, so
+ * it runs even if the survey callback is blocked on something other than the
+ * LTE work queue. NOTE (limitation): recovery is delegated through m_work_q, so
+ * a callback wedged INSIDE the bus (run_on_bus' K_FOREVER) blocks the recovery
+ * too — that case still needs the application watchdog / a reboot. */
+static atomic_t m_measure_cap_fired = ATOMIC_INIT(0);
+
 static void measure_timeout_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
+
+	/* Only act if the normal exit path hasn't already claimed the expiry
+	 * (k_timer_stop cannot un-run an expiry already begun in the ISR). */
+	if (!atomic_cas(&m_measure_cap_fired, 1, 0)) {
+		return;
+	}
+
 	LOG_ERR("Measurement mode timed out - forcing FSM recovery");
 	delegate_event(CTR_LTE_V2_EVENT_ERROR);
 }
@@ -589,25 +613,33 @@ static void measure_timer_handler(struct k_timer *timer)
 	/* ISR context: clearing the bit is atomic and ISR-safe; delegating the
 	 * event takes a mutex, so defer that to the system work queue. */
 	if (atomic_test_and_clear_bit(&m_flag, FLAG_MEASUREMENT_MODE)) {
+		atomic_set(&m_measure_cap_fired, 1);
 		k_work_submit(&m_measure_timeout_work);
 	}
 }
 
 static K_TIMER_DEFINE(m_measure_timer, measure_timer_handler, NULL);
 
-/* Runs ON the bus thread: makes the READY check and the flag set atomic with
- * respect to the FSM (which transitions only on that thread). */
+/* Runs ON the bus thread: makes the entry checks and the flag set atomic with
+ * respect to the FSM (which transitions only on that thread). Reports the
+ * result through *rc so a second concurrent entry is rejected — the FSM is
+ * frozen IN READY while a survey runs, so a state check alone cannot detect it. */
 static int do_measure_enter(void *arg)
 {
-	bool *ok = arg;
+	int *rc = arg;
+
+	if (atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE)) {
+		*rc = -EBUSY;
+		return 0;
+	}
 
 	if (m_state != FSM_STATE_READY) {
-		*ok = false;
+		*rc = -EAGAIN;
 		return 0;
 	}
 
 	atomic_set_bit(&m_flag, FLAG_MEASUREMENT_MODE);
-	*ok = true;
+	*rc = 0;
 	return 0;
 }
 
@@ -619,6 +651,17 @@ static int do_measure_exit(void *arg)
 	ARG_UNUSED(arg);
 
 	atomic_clear_bit(&m_flag, FLAG_MEASUREMENT_MODE);
+
+	/* The survey took the modem offline (CFUN=4), but CONNECTED_BIT is only
+	 * cleared by ATTACH/OPEN_SOCKET/ERROR — none of which ran while the FSM
+	 * was quiesced. Clear it here so a caller doing wait_for_connected() after
+	 * the survey actually waits for the re-attach instead of returning
+	 * immediately and transmitting into a modem that is being reset. */
+	k_event_clear(&m_states_event, CONNECTED_BIT);
+
+	/* Flag is already clear, so the measurement-mode guard in reconnect()
+	 * (which exists to stop OTHER callers tearing down a live survey) lets
+	 * this through. */
 	return ctr_lte_v2_reconnect();
 }
 
@@ -633,22 +676,27 @@ int ctr_lte_v2_measure(int (*fn)(void *arg), void *arg, k_timeout_t timeout)
 		return -ENOTSUP;
 	}
 
-	/* Enter only from a stable attached/READY state — the survey needs the
-	 * modem powered and the FSM idle. Checked + set on the bus thread. */
-	bool entered = false;
-	int ret = ctr_lte_v2_run_on_bus(do_measure_enter, &entered);
+	/* Enter only from a stable attached/READY state, and only one at a time.
+	 * Both checks + the flag set happen on the bus thread. */
+	int rc = 0;
+	int ret = ctr_lte_v2_run_on_bus(do_measure_enter, &rc);
 	if (ret) {
 		return ret;
 	}
-	if (!entered) {
-		LOG_WRN("Measurement requires READY state (current: %s)", fsm_state_str(m_state));
-		return -EAGAIN;
+	if (rc == -EBUSY) {
+		LOG_WRN("Measurement mode already active");
+		return -EBUSY;
+	}
+	if (rc) {
+		LOG_WRN("Measurement requires READY state");
+		return rc;
 	}
 
 	LOG_INF("Entering measurement mode");
 
 	/* Hard cap: if fn never returns, the timer clears the flag and kicks the
 	 * FSM into its ERROR/recovery path anyway. */
+	atomic_clear(&m_measure_cap_fired);
 	if (!K_TIMEOUT_EQ(timeout, K_FOREVER) && !K_TIMEOUT_EQ(timeout, K_NO_WAIT)) {
 		k_timer_start(&m_measure_timer, timeout, K_NO_WAIT);
 	}
@@ -659,6 +707,12 @@ int ctr_lte_v2_measure(int (*fn)(void *arg), void *arg, k_timeout_t timeout)
 	}
 
 	k_timer_stop(&m_measure_timer);
+
+	/* Claim the expiry if it fired but its work item hasn't run yet, so it
+	 * cannot inject a stale ERROR into the FSM after we have recovered. */
+	if (atomic_cas(&m_measure_cap_fired, 1, 0)) {
+		LOG_WRN("Measurement hard cap expired during the survey");
+	}
 
 	/* Always restore, on every path: clear the flag, then reconnect()
 	 * re-derives %XSYSTEMMODE from config and re-attaches (cloud resumes on

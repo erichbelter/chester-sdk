@@ -183,10 +183,15 @@ int ctr_lte_v2_reconnect(void);
  *                 into its recovery path) so a wedged callback cannot leave the
  *                 modem quiesced. K_FOREVER/K_NO_WAIT disable the cap.
  *
+ * THREADING: do not call from the system work queue or from the LTE subsystem's
+ * own work queue — @p fn blocks for the whole survey, and the hard-cap recovery
+ * is dispatched via those queues. Use a dedicated work queue or thread.
+ *
  * @retval fn's return value on success.
  * @retval -EINVAL   @p fn is NULL.
  * @retval -ENOTSUP  Test mode is enabled.
  * @retval -EAGAIN   Modem not in READY state (not attached).
+ * @retval -EBUSY    A measurement is already in progress.
  */
 int ctr_lte_v2_measure(int (*fn)(void *arg), void *arg, k_timeout_t timeout);
 
