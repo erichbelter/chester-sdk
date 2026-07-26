@@ -85,17 +85,34 @@ K_MUTEX_DEFINE(m_event_rb_lock);
 #define FLAG_SEND_PENDING BIT(3)
 #define FLAG_RECV_PENDING BIT(4)
 /* Measurement mode (ctr_lte_v2_measure): RAM-only, non-persisted. While set, the
- * READY-state FSM quiesces (ignores SEND/DEREGISTERED/TIMEOUT and the implicit
- * any-failure->ERROR edge) so an app has exclusive modem AT access for a survey.
+ * FSM quiesces (every event except CSCON is dropped at dispatch) so an app has
+ * exclusive modem AT access for a survey.
  * NB: the flags above are used as atomic *bit indices* (so BIT(0..4) occupy bit
  * positions 1,2,4,8,16). BIT(5)=32 would be an out-of-range shift on the 32-bit
  * atomic, so this uses a plain unused low index instead. */
 #define FLAG_MEASUREMENT_MODE 5
 atomic_t m_flag = ATOMIC_INIT(0);
-/* The BIT()-valued flags above are used as indices 1,2,4,8,16; 5 is free. Any
- * future flag must also be an unused index < 32 (a BIT(5) here would index bit
- * 32 and run off the end of the atomic). */
+/* The BIT()-valued flags above are used as indices 1,2,4,8,16; 5 is free. Guard
+ * both hazards: a new plain index must stay in range, and must not collide with
+ * an existing flag's index. */
 BUILD_ASSERT(FLAG_MEASUREMENT_MODE < 32, "flag must be a valid atomic bit index");
+BUILD_ASSERT(FLAG_RECV_PENDING < 32, "flag must be a valid atomic bit index");
+BUILD_ASSERT(FLAG_MEASUREMENT_MODE != FLAG_CSCON && FLAG_MEASUREMENT_MODE != FLAG_GNSS_ENABLE &&
+		     FLAG_MEASUREMENT_MODE != FLAG_CFUN4 &&
+		     FLAG_MEASUREMENT_MODE != FLAG_SEND_PENDING &&
+		     FLAG_MEASUREMENT_MODE != FLAG_RECV_PENDING,
+	     "measurement-mode flag collides with an existing flag index");
+
+/* Compiles to a constant false when the feature is off, so the gates below cost
+ * nothing (and the timer/work objects are not linked in at all). */
+static inline bool measurement_mode_active(void)
+{
+#if defined(CONFIG_CTR_LTE_V2_MEASURE)
+	return atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE);
+#else
+	return false;
+#endif
+}
 
 #define CONNECTED_BIT      BIT(0)
 #define SEND_RECV_DONE_BIT BIT(1)
@@ -438,8 +455,8 @@ static void event_handler(enum ctr_lte_v2_event event)
 	 * (which would hard-reset the modem mid-survey). Gating here rather than
 	 * per-case covers every state and every future event. FSM/modem state is
 	 * fully re-established by the reconnect() ctr_lte_v2_measure() does on exit. */
-	if (atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE) &&
-	    event != CTR_LTE_V2_EVENT_CSCON_0 && event != CTR_LTE_V2_EVENT_CSCON_1) {
+	if (measurement_mode_active() && event != CTR_LTE_V2_EVENT_CSCON_0 &&
+	    event != CTR_LTE_V2_EVENT_CSCON_1) {
 		LOG_DBG("measurement mode: dropping event %s", ctr_lte_v2_str_fsm_event(event));
 		return;
 	}
@@ -555,7 +572,7 @@ int ctr_lte_v2_reconnect(void)
 	 * tear the link down under an in-flight measurement and violate the
 	 * single-owner-bus invariant. ctr_lte_v2_measure()'s own exit path clears
 	 * the flag before calling this, so it is unaffected. */
-	if (atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE)) {
+	if (measurement_mode_active()) {
 		LOG_WRN("Reconnect refused: measurement mode active");
 		return -EBUSY;
 	}
@@ -583,6 +600,8 @@ int ctr_lte_v2_reconnect(void)
 
 	return 0;
 }
+
+#if defined(CONFIG_CTR_LTE_V2_MEASURE)
 
 /* Hard cap for measurement mode. The timer fires from the system clock ISR, so
  * it runs even if the survey callback is blocked on something other than the
@@ -722,8 +741,13 @@ int ctr_lte_v2_measure(int (*fn)(void *arg), void *arg, k_timeout_t timeout)
 	int rret = ctr_lte_v2_run_on_bus(do_measure_exit, NULL);
 	if (rret) {
 		LOG_ERR("Measurement mode exit/reconnect failed: %d", rret);
-		/* Belt-and-braces: never leave the FSM quiesced. */
+		/* Belt-and-braces: never leave the FSM quiesced... */
 		atomic_clear_bit(&m_flag, FLAG_MEASUREMENT_MODE);
+		/* ...and never leave it parked with no path back. reconnect() can
+		 * refuse (-ENOTSUP/-ENODEV), which would otherwise strand the FSM in
+		 * READY with a modem the survey left offline/reconfigured. ERROR is
+		 * state-agnostic and lands in the timed recovery ladder. */
+		delegate_event(CTR_LTE_V2_EVENT_ERROR);
 		if (!ret) {
 			ret = rret;
 		}
@@ -731,6 +755,20 @@ int ctr_lte_v2_measure(int (*fn)(void *arg), void *arg, k_timeout_t timeout)
 
 	return ret;
 }
+
+#else /* !CONFIG_CTR_LTE_V2_MEASURE */
+
+int ctr_lte_v2_measure(int (*fn)(void *arg), void *arg, k_timeout_t timeout)
+{
+	ARG_UNUSED(fn);
+	ARG_UNUSED(arg);
+	ARG_UNUSED(timeout);
+
+	LOG_WRN("CONFIG_CTR_LTE_V2_MEASURE is not enabled");
+	return -ENOTSUP;
+}
+
+#endif /* CONFIG_CTR_LTE_V2_MEASURE */
 
 int ctr_lte_v2_is_attached(bool *attached)
 {
