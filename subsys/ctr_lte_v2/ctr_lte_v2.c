@@ -426,16 +426,26 @@ static void event_handler(enum ctr_lte_v2_event event)
 {
 	LOG_INF("event: %s, state: %s", ctr_lte_v2_str_fsm_event(event), fsm_state_str(m_state));
 
+	/* Measurement mode: an app holds the modem for a survey and deliberately
+	 * puts it in non-standard states (CFUN=4, both-RAT %XSYSTEMMODE). Drop
+	 * every event except CSCON bookkeeping so NO state handler can transition
+	 * the FSM out from under it — notably %XMODEMSLEEP->SLEEP (which would
+	 * disable the UART and fail every subsequent AT) and an explicit ERROR
+	 * (which would hard-reset the modem mid-survey). Gating here rather than
+	 * per-case covers every state and every future event. FSM/modem state is
+	 * fully re-established by the reconnect() ctr_lte_v2_measure() does on exit. */
+	if (atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE) &&
+	    event != CTR_LTE_V2_EVENT_CSCON_0 && event != CTR_LTE_V2_EVENT_CSCON_1) {
+		LOG_DBG("measurement mode: dropping event %s", ctr_lte_v2_str_fsm_event(event));
+		return;
+	}
+
 	struct fsm_state_desc *fsm_state = get_fsm_state(m_state);
 	if (fsm_state && fsm_state->event_handler) {
 		int ret = fsm_state->event_handler(event);
 		if (ret < 0) {
 			LOG_WRN("failed to handle event, error: %i", ret);
-			/* In measurement mode the survey may leave the modem in a
-			 * non-standard state (CFUN=4, mid-XSYSTEMMODE); don't let a
-			 * transient handler failure kick the FSM into ERROR/reconnect. */
-			if (event != CTR_LTE_V2_EVENT_ERROR &&
-			    !atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE)) {
+			if (event != CTR_LTE_V2_EVENT_ERROR) {
 				delegate_event(CTR_LTE_V2_EVENT_ERROR);
 			}
 		}
@@ -560,10 +570,60 @@ int ctr_lte_v2_reconnect(void)
 	return 0;
 }
 
+/* Hard-cap watchdog for measurement mode. The timer fires from the system clock
+ * ISR, so it still runs if the LTE work queue is wedged — this is the backstop
+ * that guarantees the FSM can never stay quiesced (and the modem unreachable)
+ * forever because a survey callback failed to return. */
+static void measure_timeout_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	LOG_ERR("Measurement mode timed out - forcing FSM recovery");
+	delegate_event(CTR_LTE_V2_EVENT_ERROR);
+}
+
+static K_WORK_DEFINE(m_measure_timeout_work, measure_timeout_work_handler);
+
+static void measure_timer_handler(struct k_timer *timer)
+{
+	ARG_UNUSED(timer);
+	/* ISR context: clearing the bit is atomic and ISR-safe; delegating the
+	 * event takes a mutex, so defer that to the system work queue. */
+	if (atomic_test_and_clear_bit(&m_flag, FLAG_MEASUREMENT_MODE)) {
+		k_work_submit(&m_measure_timeout_work);
+	}
+}
+
+static K_TIMER_DEFINE(m_measure_timer, measure_timer_handler, NULL);
+
+/* Runs ON the bus thread: makes the READY check and the flag set atomic with
+ * respect to the FSM (which transitions only on that thread). */
+static int do_measure_enter(void *arg)
+{
+	bool *ok = arg;
+
+	if (m_state != FSM_STATE_READY) {
+		*ok = false;
+		return 0;
+	}
+
+	atomic_set_bit(&m_flag, FLAG_MEASUREMENT_MODE);
+	*ok = true;
+	return 0;
+}
+
+/* Runs ON the bus thread: clears the flag and performs the reconnect there, so
+ * the resulting state transitions and AT dialogs keep the single-owner-bus
+ * invariant instead of racing the FSM from the caller's thread. */
+static int do_measure_exit(void *arg)
+{
+	ARG_UNUSED(arg);
+
+	atomic_clear_bit(&m_flag, FLAG_MEASUREMENT_MODE);
+	return ctr_lte_v2_reconnect();
+}
+
 int ctr_lte_v2_measure(int (*fn)(void *arg), void *arg, k_timeout_t timeout)
 {
-	ARG_UNUSED(timeout); /* reserved: fn bounds its own AT waits for now */
-
 	if (fn == NULL) {
 		return -EINVAL;
 	}
@@ -574,29 +634,42 @@ int ctr_lte_v2_measure(int (*fn)(void *arg), void *arg, k_timeout_t timeout)
 	}
 
 	/* Enter only from a stable attached/READY state — the survey needs the
-	 * modem powered and the FSM idle. */
-	if (m_state != FSM_STATE_READY) {
+	 * modem powered and the FSM idle. Checked + set on the bus thread. */
+	bool entered = false;
+	int ret = ctr_lte_v2_run_on_bus(do_measure_enter, &entered);
+	if (ret) {
+		return ret;
+	}
+	if (!entered) {
 		LOG_WRN("Measurement requires READY state (current: %s)", fsm_state_str(m_state));
 		return -EAGAIN;
 	}
 
 	LOG_INF("Entering measurement mode");
-	atomic_set_bit(&m_flag, FLAG_MEASUREMENT_MODE);
 
-	int ret = fn(arg);
+	/* Hard cap: if fn never returns, the timer clears the flag and kicks the
+	 * FSM into its ERROR/recovery path anyway. */
+	if (!K_TIMEOUT_EQ(timeout, K_FOREVER) && !K_TIMEOUT_EQ(timeout, K_NO_WAIT)) {
+		k_timer_start(&m_measure_timer, timeout, K_NO_WAIT);
+	}
+
+	ret = fn(arg);
 	if (ret) {
 		LOG_WRN("Measurement callback returned: %d", ret);
 	}
 
+	k_timer_stop(&m_measure_timer);
+
 	/* Always restore, on every path: clear the flag, then reconnect()
 	 * re-derives %XSYSTEMMODE from config and re-attaches (cloud resumes on
 	 * its own). Self-reverting — no persisted state. */
-	atomic_clear_bit(&m_flag, FLAG_MEASUREMENT_MODE);
 	LOG_INF("Exiting measurement mode - reconnecting");
 
-	int rret = ctr_lte_v2_reconnect();
+	int rret = ctr_lte_v2_run_on_bus(do_measure_exit, NULL);
 	if (rret) {
-		LOG_ERR("Call `ctr_lte_v2_reconnect` failed: %d", rret);
+		LOG_ERR("Measurement mode exit/reconnect failed: %d", rret);
+		/* Belt-and-braces: never leave the FSM quiesced. */
+		atomic_clear_bit(&m_flag, FLAG_MEASUREMENT_MODE);
 		if (!ret) {
 			ret = rret;
 		}
@@ -1253,9 +1326,8 @@ static int ready_event_handler(enum ctr_lte_v2_event event)
 {
 	switch (event) {
 	case CTR_LTE_V2_EVENT_SEND:
-		if (atomic_test_bit(&m_flag, FLAG_CFUN4) ||
-		    atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE)) {
-			return 0; /* ignore SEND (CFUN4, or measurement mode holds the modem) */
+		if (atomic_test_bit(&m_flag, FLAG_CFUN4)) {
+			return 0; /* ignore SEND event */
 		}
 		stop_timer();
 		int ret = ctr_lte_v2_flow_check();
@@ -1265,9 +1337,8 @@ static int ready_event_handler(enum ctr_lte_v2_event event)
 		transition_state(FSM_STATE_SEND);
 		break;
 	case CTR_LTE_V2_EVENT_DEREGISTERED:
-		if (atomic_test_bit(&m_flag, FLAG_CFUN4) ||
-		    atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE)) {
-			return 0; /* ignore DEREGISTERED (CFUN4, or measurement mode's own CFUN=4) */
+		if (atomic_test_bit(&m_flag, FLAG_CFUN4)) {
+			return 0; /* ignore DEREGISTERED event */
 		}
 		transition_state(FSM_STATE_ATTACH);
 		break;
@@ -1298,11 +1369,6 @@ static int ready_event_handler(enum ctr_lte_v2_event event)
 		transition_state(FSM_STATE_SLEEP);
 		break;
 	case CTR_LTE_V2_EVENT_TIMEOUT:
-		if (atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE)) {
-			/* measurement mode: suppress auto-offline AND the fall-through
-			 * to ERROR (PSM-supported case) — the survey owns the modem. */
-			return 0;
-		}
 		if (m_cereg_param.active_time == -1) { /* if PSM is not supported */
 			/* Phase 2: belt-and-braces. The on_enter_ready guard
 			 * normally prevents the timer from arming, but if any

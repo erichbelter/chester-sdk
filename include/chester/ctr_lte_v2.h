@@ -178,7 +178,10 @@ int ctr_lte_v2_reconnect(void);
  *
  * @param fn       Survey callback; issues AT via ctr_lte_v2_consumer_at_cmd*().
  * @param arg      Opaque argument passed to @p fn.
- * @param timeout  Reserved for a future hard cap; @p fn bounds its own AT waits.
+ * @param timeout  Hard cap. If @p fn has not returned by then, measurement mode
+ *                 is force-exited from a timer ISR (flag cleared, FSM kicked
+ *                 into its recovery path) so a wedged callback cannot leave the
+ *                 modem quiesced. K_FOREVER/K_NO_WAIT disable the cap.
  *
  * @retval fn's return value on success.
  * @retval -EINVAL   @p fn is NULL.
