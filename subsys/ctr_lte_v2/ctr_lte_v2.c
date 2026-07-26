@@ -96,7 +96,9 @@ atomic_t m_flag = ATOMIC_INIT(0);
  * both hazards: a new plain index must stay in range, and must not collide with
  * an existing flag's index. */
 BUILD_ASSERT(FLAG_MEASUREMENT_MODE < 32, "flag must be a valid atomic bit index");
-BUILD_ASSERT(FLAG_RECV_PENDING < 32, "flag must be a valid atomic bit index");
+BUILD_ASSERT(FLAG_CSCON < 32 && FLAG_GNSS_ENABLE < 32 && FLAG_CFUN4 < 32 &&
+		     FLAG_SEND_PENDING < 32 && FLAG_RECV_PENDING < 32,
+	     "flag must be a valid atomic bit index");
 BUILD_ASSERT(FLAG_MEASUREMENT_MODE != FLAG_CSCON && FLAG_MEASUREMENT_MODE != FLAG_GNSS_ENABLE &&
 		     FLAG_MEASUREMENT_MODE != FLAG_CFUN4 &&
 		     FLAG_MEASUREMENT_MODE != FLAG_SEND_PENDING &&
@@ -690,6 +692,12 @@ int ctr_lte_v2_measure(int (*fn)(void *arg), void *arg, k_timeout_t timeout)
 		return -EINVAL;
 	}
 
+	/* A capless measurement can never be force-exited; refuse it. */
+	if (K_TIMEOUT_EQ(timeout, K_FOREVER) || K_TIMEOUT_EQ(timeout, K_NO_WAIT)) {
+		LOG_ERR("Measurement requires a bounded timeout");
+		return -EINVAL;
+	}
+
 	if (g_ctr_lte_v2_config.test) {
 		LOG_WRN("LTE Test mode enabled");
 		return -ENOTSUP;
@@ -714,11 +722,11 @@ int ctr_lte_v2_measure(int (*fn)(void *arg), void *arg, k_timeout_t timeout)
 	LOG_INF("Entering measurement mode");
 
 	/* Hard cap: if fn never returns, the timer clears the flag and kicks the
-	 * FSM into its ERROR/recovery path anyway. */
+	 * FSM into its ERROR/recovery path anyway. A capless call would leave the
+	 * FSM quiesced forever on a wedged callback (no cloud, no FOTA, J-Link
+	 * only), so an unbounded timeout is rejected rather than honoured. */
 	atomic_clear(&m_measure_cap_fired);
-	if (!K_TIMEOUT_EQ(timeout, K_FOREVER) && !K_TIMEOUT_EQ(timeout, K_NO_WAIT)) {
-		k_timer_start(&m_measure_timer, timeout, K_NO_WAIT);
-	}
+	k_timer_start(&m_measure_timer, timeout, K_NO_WAIT);
 
 	ret = fn(arg);
 	if (ret) {

@@ -178,10 +178,12 @@ int ctr_lte_v2_reconnect(void);
  *
  * @param fn       Survey callback; issues AT via ctr_lte_v2_consumer_at_cmd*().
  * @param arg      Opaque argument passed to @p fn.
- * @param timeout  Hard cap. If @p fn has not returned by then, measurement mode
- *                 is force-exited from a timer ISR (flag cleared, FSM kicked
- *                 into its recovery path) so a wedged callback cannot leave the
- *                 modem quiesced. K_FOREVER/K_NO_WAIT disable the cap.
+ * @param timeout  Hard cap, and it MUST be bounded. If @p fn has not returned by
+ *                 then, measurement mode is force-exited from a timer ISR (flag
+ *                 cleared, FSM kicked into its recovery path) so a wedged
+ *                 callback cannot leave the modem quiesced. K_FOREVER and
+ *                 K_NO_WAIT are rejected with -EINVAL: without a cap a wedged
+ *                 callback would strand the node with no cloud and no FOTA.
  *
  * THREADING: do not call from the system work queue or from the LTE subsystem's
  * own work queue — @p fn blocks for the whole survey, and the hard-cap recovery
