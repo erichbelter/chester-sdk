@@ -166,6 +166,28 @@ int ctr_lte_v2_enable(void);
 int ctr_lte_v2_reconnect(void);
 
 /**
+ * @brief Run a survey callback with exclusive modem control (measurement mode).
+ *
+ * Quiesces the attach FSM (while active it will not send, reconnect, or error)
+ * so @p fn has exclusive AT access to run a cellular survey via
+ * ctr_lte_v2_consumer_at_cmd*() — e.g. AT+CFUN, AT%XSYSTEMMODE, AT%NCELLMEAS,
+ * AT%COPS. On return (any path) the configured %XSYSTEMMODE is restored and
+ * normal attach + cloud resume via an internal reconnect(). Measurement mode is
+ * RAM-only / non-persisted: a reboot mid-survey boots straight into normal mode
+ * and auto-recovers (it cannot strand the device).
+ *
+ * @param fn       Survey callback; issues AT via ctr_lte_v2_consumer_at_cmd*().
+ * @param arg      Opaque argument passed to @p fn.
+ * @param timeout  Reserved for a future hard cap; @p fn bounds its own AT waits.
+ *
+ * @retval fn's return value on success.
+ * @retval -EINVAL   @p fn is NULL.
+ * @retval -ENOTSUP  Test mode is enabled.
+ * @retval -EAGAIN   Modem not in READY state (not attached).
+ */
+int ctr_lte_v2_measure(int (*fn)(void *arg), void *arg, k_timeout_t timeout);
+
+/**
  * @brief Wait for connection to be established.
  *
  * @param timeout  Maximum wait duration.

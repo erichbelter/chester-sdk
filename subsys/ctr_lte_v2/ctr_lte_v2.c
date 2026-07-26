@@ -84,6 +84,13 @@ K_MUTEX_DEFINE(m_event_rb_lock);
 #define FLAG_CFUN4        BIT(2)
 #define FLAG_SEND_PENDING BIT(3)
 #define FLAG_RECV_PENDING BIT(4)
+/* Measurement mode (ctr_lte_v2_measure): RAM-only, non-persisted. While set, the
+ * READY-state FSM quiesces (ignores SEND/DEREGISTERED/TIMEOUT and the implicit
+ * any-failure->ERROR edge) so an app has exclusive modem AT access for a survey.
+ * NB: the flags above are used as atomic *bit indices* (so BIT(0..4) occupy bit
+ * positions 1,2,4,8,16). BIT(5)=32 would be an out-of-range shift on the 32-bit
+ * atomic, so this uses a plain unused low index instead. */
+#define FLAG_MEASUREMENT_MODE 5
 atomic_t m_flag = ATOMIC_INIT(0);
 
 #define CONNECTED_BIT      BIT(0)
@@ -424,7 +431,11 @@ static void event_handler(enum ctr_lte_v2_event event)
 		int ret = fsm_state->event_handler(event);
 		if (ret < 0) {
 			LOG_WRN("failed to handle event, error: %i", ret);
-			if (event != CTR_LTE_V2_EVENT_ERROR) {
+			/* In measurement mode the survey may leave the modem in a
+			 * non-standard state (CFUN=4, mid-XSYSTEMMODE); don't let a
+			 * transient handler failure kick the FSM into ERROR/reconnect. */
+			if (event != CTR_LTE_V2_EVENT_ERROR &&
+			    !atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE)) {
 				delegate_event(CTR_LTE_V2_EVENT_ERROR);
 			}
 		}
@@ -547,6 +558,51 @@ int ctr_lte_v2_reconnect(void)
 	delegate_event(CTR_LTE_V2_EVENT_ENABLE);
 
 	return 0;
+}
+
+int ctr_lte_v2_measure(int (*fn)(void *arg), void *arg, k_timeout_t timeout)
+{
+	ARG_UNUSED(timeout); /* reserved: fn bounds its own AT waits for now */
+
+	if (fn == NULL) {
+		return -EINVAL;
+	}
+
+	if (g_ctr_lte_v2_config.test) {
+		LOG_WRN("LTE Test mode enabled");
+		return -ENOTSUP;
+	}
+
+	/* Enter only from a stable attached/READY state — the survey needs the
+	 * modem powered and the FSM idle. */
+	if (m_state != FSM_STATE_READY) {
+		LOG_WRN("Measurement requires READY state (current: %s)", fsm_state_str(m_state));
+		return -EAGAIN;
+	}
+
+	LOG_INF("Entering measurement mode");
+	atomic_set_bit(&m_flag, FLAG_MEASUREMENT_MODE);
+
+	int ret = fn(arg);
+	if (ret) {
+		LOG_WRN("Measurement callback returned: %d", ret);
+	}
+
+	/* Always restore, on every path: clear the flag, then reconnect()
+	 * re-derives %XSYSTEMMODE from config and re-attaches (cloud resumes on
+	 * its own). Self-reverting — no persisted state. */
+	atomic_clear_bit(&m_flag, FLAG_MEASUREMENT_MODE);
+	LOG_INF("Exiting measurement mode - reconnecting");
+
+	int rret = ctr_lte_v2_reconnect();
+	if (rret) {
+		LOG_ERR("Call `ctr_lte_v2_reconnect` failed: %d", rret);
+		if (!ret) {
+			ret = rret;
+		}
+	}
+
+	return ret;
 }
 
 int ctr_lte_v2_is_attached(bool *attached)
@@ -1197,8 +1253,9 @@ static int ready_event_handler(enum ctr_lte_v2_event event)
 {
 	switch (event) {
 	case CTR_LTE_V2_EVENT_SEND:
-		if (atomic_test_bit(&m_flag, FLAG_CFUN4)) {
-			return 0; /* ignore SEND event */
+		if (atomic_test_bit(&m_flag, FLAG_CFUN4) ||
+		    atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE)) {
+			return 0; /* ignore SEND (CFUN4, or measurement mode holds the modem) */
 		}
 		stop_timer();
 		int ret = ctr_lte_v2_flow_check();
@@ -1208,8 +1265,9 @@ static int ready_event_handler(enum ctr_lte_v2_event event)
 		transition_state(FSM_STATE_SEND);
 		break;
 	case CTR_LTE_V2_EVENT_DEREGISTERED:
-		if (atomic_test_bit(&m_flag, FLAG_CFUN4)) {
-			return 0; /* ignore DEREGISTERED event */
+		if (atomic_test_bit(&m_flag, FLAG_CFUN4) ||
+		    atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE)) {
+			return 0; /* ignore DEREGISTERED (CFUN4, or measurement mode's own CFUN=4) */
 		}
 		transition_state(FSM_STATE_ATTACH);
 		break;
@@ -1240,6 +1298,11 @@ static int ready_event_handler(enum ctr_lte_v2_event event)
 		transition_state(FSM_STATE_SLEEP);
 		break;
 	case CTR_LTE_V2_EVENT_TIMEOUT:
+		if (atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE)) {
+			/* measurement mode: suppress auto-offline AND the fall-through
+			 * to ERROR (PSM-supported case) — the survey owns the modem. */
+			return 0;
+		}
 		if (m_cereg_param.active_time == -1) { /* if PSM is not supported */
 			/* Phase 2: belt-and-braces. The on_enter_ready guard
 			 * normally prevents the timer from arming, but if any
