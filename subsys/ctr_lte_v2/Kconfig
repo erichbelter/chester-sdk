@@ -138,6 +138,21 @@ config CTR_LTE_V2_EDRX_CYCLE_NBIOT
 	  "0001" is valid on LTE-M but invalid on NB-IoT, where the network
 	  silently refuses it (no eDRX granted).
 
+config CTR_LTE_V2_MEASURE
+	bool "Measurement mode (ctr_lte_v2_measure)"
+	default n
+	help
+	  Enables ctr_lte_v2_measure(): a runtime, non-persisted mode that
+	  quiesces the attach FSM so an application can take exclusive modem
+	  control for a cellular survey (AT+CFUN / %XSYSTEMMODE / %NCELLMEAS /
+	  %COPS) and then automatically restores config and reconnects.
+
+	  Leave disabled unless an application actually uses it. Enabling it
+	  adds a static k_timer plus a work item (~76 B RAM) that the linker
+	  CANNOT garbage-collect (they live in KEEP-ed iterable sections), which
+	  matters on RAM-tight images. With this disabled the feature compiles
+	  out completely and the FSM is byte-identical to a tree without it.
+
 config HEAP_MEM_POOL_SIZE
 	int "HEAP_MEM_POOL_SIZE"
 	default 8192

@@ -166,6 +166,38 @@ int ctr_lte_v2_enable(void);
 int ctr_lte_v2_reconnect(void);
 
 /**
+ * @brief Run a survey callback with exclusive modem control (measurement mode).
+ *
+ * Quiesces the attach FSM (while active it will not send, reconnect, or error)
+ * so @p fn has exclusive AT access to run a cellular survey via
+ * ctr_lte_v2_consumer_at_cmd*() — e.g. AT+CFUN, AT%XSYSTEMMODE, AT%NCELLMEAS,
+ * AT%COPS. On return (any path) the configured %XSYSTEMMODE is restored and
+ * normal attach + cloud resume via an internal reconnect(). Measurement mode is
+ * RAM-only / non-persisted: a reboot mid-survey boots straight into normal mode
+ * and auto-recovers (it cannot strand the device).
+ *
+ * @param fn       Survey callback; issues AT via ctr_lte_v2_consumer_at_cmd*().
+ * @param arg      Opaque argument passed to @p fn.
+ * @param timeout  Hard cap, and it MUST be bounded. If @p fn has not returned by
+ *                 then, measurement mode is force-exited from a timer ISR (flag
+ *                 cleared, FSM kicked into its recovery path) so a wedged
+ *                 callback cannot leave the modem quiesced. K_FOREVER and
+ *                 K_NO_WAIT are rejected with -EINVAL: without a cap a wedged
+ *                 callback would strand the node with no cloud and no FOTA.
+ *
+ * THREADING: do not call from the system work queue or from the LTE subsystem's
+ * own work queue — @p fn blocks for the whole survey, and the hard-cap recovery
+ * is dispatched via those queues. Use a dedicated work queue or thread.
+ *
+ * @retval fn's return value on success.
+ * @retval -EINVAL   @p fn is NULL.
+ * @retval -ENOTSUP  Test mode is enabled.
+ * @retval -EAGAIN   Modem not in READY state (not attached).
+ * @retval -EBUSY    A measurement is already in progress.
+ */
+int ctr_lte_v2_measure(int (*fn)(void *arg), void *arg, k_timeout_t timeout);
+
+/**
  * @brief Wait for connection to be established.
  *
  * @param timeout  Maximum wait duration.

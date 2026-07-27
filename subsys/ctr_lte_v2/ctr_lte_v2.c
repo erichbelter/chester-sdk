@@ -84,7 +84,37 @@ K_MUTEX_DEFINE(m_event_rb_lock);
 #define FLAG_CFUN4        BIT(2)
 #define FLAG_SEND_PENDING BIT(3)
 #define FLAG_RECV_PENDING BIT(4)
+/* Measurement mode (ctr_lte_v2_measure): RAM-only, non-persisted. While set, the
+ * FSM quiesces (every event except CSCON is dropped at dispatch) so an app has
+ * exclusive modem AT access for a survey.
+ * NB: the flags above are used as atomic *bit indices* (so BIT(0..4) occupy bit
+ * positions 1,2,4,8,16). BIT(5)=32 would be an out-of-range shift on the 32-bit
+ * atomic, so this uses a plain unused low index instead. */
+#define FLAG_MEASUREMENT_MODE 5
 atomic_t m_flag = ATOMIC_INIT(0);
+/* The BIT()-valued flags above are used as indices 1,2,4,8,16; 5 is free. Guard
+ * both hazards: a new plain index must stay in range, and must not collide with
+ * an existing flag's index. */
+BUILD_ASSERT(FLAG_MEASUREMENT_MODE < 32, "flag must be a valid atomic bit index");
+BUILD_ASSERT(FLAG_CSCON < 32 && FLAG_GNSS_ENABLE < 32 && FLAG_CFUN4 < 32 &&
+		     FLAG_SEND_PENDING < 32 && FLAG_RECV_PENDING < 32,
+	     "flag must be a valid atomic bit index");
+BUILD_ASSERT(FLAG_MEASUREMENT_MODE != FLAG_CSCON && FLAG_MEASUREMENT_MODE != FLAG_GNSS_ENABLE &&
+		     FLAG_MEASUREMENT_MODE != FLAG_CFUN4 &&
+		     FLAG_MEASUREMENT_MODE != FLAG_SEND_PENDING &&
+		     FLAG_MEASUREMENT_MODE != FLAG_RECV_PENDING,
+	     "measurement-mode flag collides with an existing flag index");
+
+/* Compiles to a constant false when the feature is off, so the gates below cost
+ * nothing (and the timer/work objects are not linked in at all). */
+static inline bool measurement_mode_active(void)
+{
+#if defined(CONFIG_CTR_LTE_V2_MEASURE)
+	return atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE);
+#else
+	return false;
+#endif
+}
 
 #define CONNECTED_BIT      BIT(0)
 #define SEND_RECV_DONE_BIT BIT(1)
@@ -419,6 +449,20 @@ static void event_handler(enum ctr_lte_v2_event event)
 {
 	LOG_INF("event: %s, state: %s", ctr_lte_v2_str_fsm_event(event), fsm_state_str(m_state));
 
+	/* Measurement mode: an app holds the modem for a survey and deliberately
+	 * puts it in non-standard states (CFUN=4, both-RAT %XSYSTEMMODE). Drop
+	 * every event except CSCON bookkeeping so NO state handler can transition
+	 * the FSM out from under it — notably %XMODEMSLEEP->SLEEP (which would
+	 * disable the UART and fail every subsequent AT) and an explicit ERROR
+	 * (which would hard-reset the modem mid-survey). Gating here rather than
+	 * per-case covers every state and every future event. FSM/modem state is
+	 * fully re-established by the reconnect() ctr_lte_v2_measure() does on exit. */
+	if (measurement_mode_active() && event != CTR_LTE_V2_EVENT_CSCON_0 &&
+	    event != CTR_LTE_V2_EVENT_CSCON_1) {
+		LOG_DBG("measurement mode: dropping event %s", ctr_lte_v2_str_fsm_event(event));
+		return;
+	}
+
 	struct fsm_state_desc *fsm_state = get_fsm_state(m_state);
 	if (fsm_state && fsm_state->event_handler) {
 		int ret = fsm_state->event_handler(event);
@@ -525,6 +569,16 @@ int ctr_lte_v2_enable(void)
 
 int ctr_lte_v2_reconnect(void)
 {
+	/* Refuse while a survey owns the modem: this transitions the FSM from the
+	 * CALLER's thread (e.g. the `lte reconnect` shell command), which would
+	 * tear the link down under an in-flight measurement and violate the
+	 * single-owner-bus invariant. ctr_lte_v2_measure()'s own exit path clears
+	 * the flag before calling this, so it is unaffected. */
+	if (measurement_mode_active()) {
+		LOG_WRN("Reconnect refused: measurement mode active");
+		return -EBUSY;
+	}
+
 	if (g_ctr_lte_v2_config.test) {
 		LOG_WRN("LTE Test mode enabled");
 		return -ENOTSUP;
@@ -548,6 +602,181 @@ int ctr_lte_v2_reconnect(void)
 
 	return 0;
 }
+
+#if defined(CONFIG_CTR_LTE_V2_MEASURE)
+
+/* Hard cap for measurement mode. The timer fires from the system clock ISR, so
+ * it runs even if the survey callback is blocked on something other than the
+ * LTE work queue. NOTE (limitation): recovery is delegated through m_work_q, so
+ * a callback wedged INSIDE the bus (run_on_bus' K_FOREVER) blocks the recovery
+ * too — that case still needs the application watchdog / a reboot. */
+static atomic_t m_measure_cap_fired = ATOMIC_INIT(0);
+
+static void measure_timeout_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	/* Only act if the normal exit path hasn't already claimed the expiry
+	 * (k_timer_stop cannot un-run an expiry already begun in the ISR). */
+	if (!atomic_cas(&m_measure_cap_fired, 1, 0)) {
+		return;
+	}
+
+	LOG_ERR("Measurement mode timed out - forcing FSM recovery");
+	delegate_event(CTR_LTE_V2_EVENT_ERROR);
+}
+
+static K_WORK_DEFINE(m_measure_timeout_work, measure_timeout_work_handler);
+
+static void measure_timer_handler(struct k_timer *timer)
+{
+	ARG_UNUSED(timer);
+	/* ISR context: clearing the bit is atomic and ISR-safe; delegating the
+	 * event takes a mutex, so defer that to the system work queue. */
+	if (atomic_test_and_clear_bit(&m_flag, FLAG_MEASUREMENT_MODE)) {
+		atomic_set(&m_measure_cap_fired, 1);
+		k_work_submit(&m_measure_timeout_work);
+	}
+}
+
+static K_TIMER_DEFINE(m_measure_timer, measure_timer_handler, NULL);
+
+/* Runs ON the bus thread: makes the entry checks and the flag set atomic with
+ * respect to the FSM (which transitions only on that thread). Reports the
+ * result through *rc so a second concurrent entry is rejected — the FSM is
+ * frozen IN READY while a survey runs, so a state check alone cannot detect it. */
+static int do_measure_enter(void *arg)
+{
+	int *rc = arg;
+
+	if (atomic_test_bit(&m_flag, FLAG_MEASUREMENT_MODE)) {
+		*rc = -EBUSY;
+		return 0;
+	}
+
+	if (m_state != FSM_STATE_READY) {
+		*rc = -EAGAIN;
+		return 0;
+	}
+
+	atomic_set_bit(&m_flag, FLAG_MEASUREMENT_MODE);
+	*rc = 0;
+	return 0;
+}
+
+/* Runs ON the bus thread: clears the flag and performs the reconnect there, so
+ * the resulting state transitions and AT dialogs keep the single-owner-bus
+ * invariant instead of racing the FSM from the caller's thread. */
+static int do_measure_exit(void *arg)
+{
+	ARG_UNUSED(arg);
+
+	atomic_clear_bit(&m_flag, FLAG_MEASUREMENT_MODE);
+
+	/* The survey took the modem offline (CFUN=4), but CONNECTED_BIT is only
+	 * cleared by ATTACH/OPEN_SOCKET/ERROR — none of which ran while the FSM
+	 * was quiesced. Clear it here so a caller doing wait_for_connected() after
+	 * the survey actually waits for the re-attach instead of returning
+	 * immediately and transmitting into a modem that is being reset. */
+	k_event_clear(&m_states_event, CONNECTED_BIT);
+
+	/* Flag is already clear, so the measurement-mode guard in reconnect()
+	 * (which exists to stop OTHER callers tearing down a live survey) lets
+	 * this through. */
+	return ctr_lte_v2_reconnect();
+}
+
+int ctr_lte_v2_measure(int (*fn)(void *arg), void *arg, k_timeout_t timeout)
+{
+	if (fn == NULL) {
+		return -EINVAL;
+	}
+
+	/* A capless measurement can never be force-exited; refuse it. */
+	if (K_TIMEOUT_EQ(timeout, K_FOREVER) || K_TIMEOUT_EQ(timeout, K_NO_WAIT)) {
+		LOG_ERR("Measurement requires a bounded timeout");
+		return -EINVAL;
+	}
+
+	if (g_ctr_lte_v2_config.test) {
+		LOG_WRN("LTE Test mode enabled");
+		return -ENOTSUP;
+	}
+
+	/* Enter only from a stable attached/READY state, and only one at a time.
+	 * Both checks + the flag set happen on the bus thread. */
+	int rc = 0;
+	int ret = ctr_lte_v2_run_on_bus(do_measure_enter, &rc);
+	if (ret) {
+		return ret;
+	}
+	if (rc == -EBUSY) {
+		LOG_WRN("Measurement mode already active");
+		return -EBUSY;
+	}
+	if (rc) {
+		LOG_WRN("Measurement requires READY state");
+		return rc;
+	}
+
+	LOG_INF("Entering measurement mode");
+
+	/* Hard cap: if fn never returns, the timer clears the flag and kicks the
+	 * FSM into its ERROR/recovery path anyway. A capless call would leave the
+	 * FSM quiesced forever on a wedged callback (no cloud, no FOTA, J-Link
+	 * only), so an unbounded timeout is rejected rather than honoured. */
+	atomic_clear(&m_measure_cap_fired);
+	k_timer_start(&m_measure_timer, timeout, K_NO_WAIT);
+
+	ret = fn(arg);
+	if (ret) {
+		LOG_WRN("Measurement callback returned: %d", ret);
+	}
+
+	k_timer_stop(&m_measure_timer);
+
+	/* Claim the expiry if it fired but its work item hasn't run yet, so it
+	 * cannot inject a stale ERROR into the FSM after we have recovered. */
+	if (atomic_cas(&m_measure_cap_fired, 1, 0)) {
+		LOG_WRN("Measurement hard cap expired during the survey");
+	}
+
+	/* Always restore, on every path: clear the flag, then reconnect()
+	 * re-derives %XSYSTEMMODE from config and re-attaches (cloud resumes on
+	 * its own). Self-reverting — no persisted state. */
+	LOG_INF("Exiting measurement mode - reconnecting");
+
+	int rret = ctr_lte_v2_run_on_bus(do_measure_exit, NULL);
+	if (rret) {
+		LOG_ERR("Measurement mode exit/reconnect failed: %d", rret);
+		/* Belt-and-braces: never leave the FSM quiesced... */
+		atomic_clear_bit(&m_flag, FLAG_MEASUREMENT_MODE);
+		/* ...and never leave it parked with no path back. reconnect() can
+		 * refuse (-ENOTSUP/-ENODEV), which would otherwise strand the FSM in
+		 * READY with a modem the survey left offline/reconfigured. ERROR is
+		 * state-agnostic and lands in the timed recovery ladder. */
+		delegate_event(CTR_LTE_V2_EVENT_ERROR);
+		if (!ret) {
+			ret = rret;
+		}
+	}
+
+	return ret;
+}
+
+#else /* !CONFIG_CTR_LTE_V2_MEASURE */
+
+int ctr_lte_v2_measure(int (*fn)(void *arg), void *arg, k_timeout_t timeout)
+{
+	ARG_UNUSED(fn);
+	ARG_UNUSED(arg);
+	ARG_UNUSED(timeout);
+
+	LOG_WRN("CONFIG_CTR_LTE_V2_MEASURE is not enabled");
+	return -ENOTSUP;
+}
+
+#endif /* CONFIG_CTR_LTE_V2_MEASURE */
 
 int ctr_lte_v2_is_attached(bool *attached)
 {
