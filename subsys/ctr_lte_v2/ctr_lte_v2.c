@@ -133,9 +133,18 @@ static uint32_t m_start_cscon1 = 0;
 struct ctr_lte_v2_cereg_param m_cereg_param = {0};
 
 #define ON_ERROR_MAX_FLOW_CHECK_RETRIES 3
+
+/* A CEREG stat of "not registered, searching" is a normal transient, so it gets
+ * its own (longer) tolerance window before the modem is reset. 6 x 5 s = 30 s,
+ * which covers a cell reselection or a short coverage dip. */
+#define ON_ERROR_MAX_SEARCHING_RETRIES 6
+#define ON_ERROR_SEARCHING_RETRY_S     5
+
 static struct {
 	enum fsm_state prev_state;
 	int flow_check_failures;
+	int searching_retries;
+	bool recheck_on_timeout;
 	enum fsm_state on_timeout_state;
 	uint32_t timeout_s;
 } m_error_ctx = {0};
@@ -989,14 +998,52 @@ static int on_leave_disabled(void)
 static int on_enter_error(void)
 {
 	m_error_ctx.on_timeout_state = FSM_STATE_BOOT; /* Default timeout state */
+	m_error_ctx.recheck_on_timeout = false;
 
 	int ret = ctr_lte_v2_flow_check();
 	if (ret == 0) {
 		m_error_ctx.flow_check_failures = 0;
+		m_error_ctx.searching_retries = 0;
 		LOG_INF("Flow check successful, resuming operation in 5 seconds");
 		m_error_ctx.on_timeout_state = FSM_STATE_READY;
 		start_timer(K_SECONDS(5));
 		return 0;
+	}
+
+	/* -ENETUNREACH is flow_check's verdict on a CEREG stat of 2, "not
+	 * registered, currently searching". That is a normal transient -- it occurs
+	 * on every cell reselection and on any brief coverage dip -- and the modem
+	 * is already recovering by itself. Resetting it here is actively harmful:
+	 * it discards the cell history and forces a fresh band scan, which is
+	 * slower than simply waiting, and it destroys every socket a consumer
+	 * holds. Give the modem a bounded window to re-register first.
+	 *
+	 * Consumers are deliberately NOT told offline during that window. The
+	 * dispatch helpers are edge-triggered, so staying silent keeps a blip
+	 * shorter than the window completely invisible to them and lets long-lived
+	 * sessions (e.g. a persistent MQTT connection) survive it untouched. If the
+	 * window expires we fall through to the normal path and they are notified
+	 * then, exactly as before. */
+	if (ret == -ENETUNREACH && m_error_ctx.searching_retries < ON_ERROR_MAX_SEARCHING_RETRIES) {
+		m_error_ctx.searching_retries++;
+
+		LOG_WRN("Network searching (attempt %d/%d), re-checking in %d seconds",
+			m_error_ctx.searching_retries, ON_ERROR_MAX_SEARCHING_RETRIES,
+			ON_ERROR_SEARCHING_RETRY_S);
+
+		/* Re-check in place rather than via on_timeout_state: transition_state()
+		 * into the state we are already in is a no-op, which would strand the
+		 * FSM in ERROR with no timer armed. */
+		m_error_ctx.recheck_on_timeout = true;
+		start_timer(K_SECONDS(ON_ERROR_SEARCHING_RETRY_S));
+		return 0;
+	}
+
+	if (m_error_ctx.searching_retries) {
+		LOG_ERR("Flow check still failing (%d) after %d searching retries, "
+			"taking fallback action",
+			ret, m_error_ctx.searching_retries);
+		m_error_ctx.searching_retries = 0;
 	}
 
 	dispatch_consumers_on_offline();
@@ -1035,10 +1082,26 @@ static int on_enter_error(void)
 	return 0;
 }
 
+static int on_leave_error(void)
+{
+	/* Keep the retry bookkeeping local to the state: if anything other than our
+	 * own re-check moves the FSM out of ERROR mid-window, the next unrelated
+	 * error must start with a full tolerance window rather than inherit a
+	 * part-spent one. */
+	m_error_ctx.searching_retries = 0;
+	m_error_ctx.recheck_on_timeout = false;
+
+	return 0;
+}
+
 static int error_event_handler(enum ctr_lte_v2_event event)
 {
 	switch (event) {
 	case CTR_LTE_V2_EVENT_TIMEOUT:
+		if (m_error_ctx.recheck_on_timeout) {
+			/* Stay in ERROR and re-evaluate the flow check; see on_enter_error(). */
+			return on_enter_error();
+		}
 		transition_state(m_error_ctx.on_timeout_state);
 		break;
 	default:
@@ -1873,7 +1936,7 @@ static int on_leave_gnss(void)
 /* clang-format off */
 static struct fsm_state_desc m_fsm_states[] = {
 	{FSM_STATE_DISABLED, on_enter_disabled, on_leave_disabled, disabled_event_handler},
-	{FSM_STATE_ERROR, on_enter_error, NULL, error_event_handler},
+	{FSM_STATE_ERROR, on_enter_error, on_leave_error, error_event_handler},
 	{FSM_STATE_BOOT, on_enter_boot, on_leave_boot, boot_event_handler},
 	{FSM_STATE_PREPARE, on_enter_prepare, on_leave_prepare, prepare_event_handler},
 	{FSM_STATE_RESET_LOOP, on_enter_reset_loop, on_leave_reset_loop, reset_loop_event_handler},
