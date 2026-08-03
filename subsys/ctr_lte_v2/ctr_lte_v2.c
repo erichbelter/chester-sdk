@@ -995,6 +995,46 @@ static int on_leave_disabled(void)
 	return 0;
 }
 
+/* Last CEREG registration status the flow layer recorded. flow_check() calls
+ * ctr_lte_v2_state_set_cereg_param() immediately before it returns its verdict,
+ * so this is the very stat that produced the error we are handling. Falls back
+ * to UNKNOWN, which is treated as recoverable -- the conservative choice, since
+ * it only costs a bounded wait. */
+static enum ctr_lte_v2_cereg_param_stat current_cereg_stat(void)
+{
+	struct ctr_lte_v2_cereg_param param;
+
+	if (ctr_lte_v2_state_get_cereg_param(&param)) {
+		return CTR_LTE_V2_CEREG_PARAM_STAT_UNKNOWN;
+	}
+
+	return param.stat;
+}
+
+/* Which non-registered CEREG states are worth waiting on rather than resetting
+ * the modem for.
+ *
+ * SEARCHING and UNKNOWN are transient: the modem is either actively looking or
+ * momentarily cannot say, and both routinely resolve by themselves within
+ * seconds (cell reselection, a brief coverage dip).
+ *
+ * REGISTRATION_DENIED and SIM_FAILURE are terminal for this attach -- the
+ * network or the UICC has refused us, and no amount of waiting changes that, so
+ * escalate immediately instead of burning the window. NOT_REGISTERED (stat 0,
+ * "not registered and not searching") is deliberately left recoverable: it is
+ * routinely observed as a brief step while the modem transitions between
+ * functional modes, and the cost of being wrong is only a bounded wait. */
+static bool cereg_stat_is_recoverable(enum ctr_lte_v2_cereg_param_stat stat)
+{
+	switch (stat) {
+	case CTR_LTE_V2_CEREG_PARAM_STAT_REGISTRATION_DENIED:
+	case CTR_LTE_V2_CEREG_PARAM_STAT_SIM_FAILURE:
+		return false;
+	default:
+		return true;
+	}
+}
+
 static int on_enter_error(void)
 {
 	m_error_ctx.on_timeout_state = FSM_STATE_BOOT; /* Default timeout state */
@@ -1010,13 +1050,15 @@ static int on_enter_error(void)
 		return 0;
 	}
 
-	/* -ENETUNREACH is flow_check's verdict on a CEREG stat of 2, "not
-	 * registered, currently searching". That is a normal transient -- it occurs
-	 * on every cell reselection and on any brief coverage dip -- and the modem
-	 * is already recovering by itself. Resetting it here is actively harmful:
-	 * it discards the cell history and forces a fresh band scan, which is
-	 * slower than simply waiting, and it destroys every socket a consumer
-	 * holds. Give the modem a bounded window to re-register first.
+	/* -ENETUNREACH is flow_check's verdict on ANY non-registered CEREG stat, so
+	 * the errno alone cannot tell a self-healing state from a terminal one --
+	 * read the stat back and decide on that. Only the recoverable ones are
+	 * worth waiting on; see cereg_stat_is_recoverable().
+	 *
+	 * Waiting is the right move for those because the modem is already
+	 * recovering by itself, and resetting it is actively harmful: it discards
+	 * the cell history and forces a fresh band scan, which is slower than
+	 * simply waiting, and it destroys every socket a consumer holds.
 	 *
 	 * Consumers are deliberately NOT told offline during that window. The
 	 * dispatch helpers are edge-triggered, so staying silent keeps a blip
@@ -1024,12 +1066,17 @@ static int on_enter_error(void)
 	 * sessions (e.g. a persistent MQTT connection) survive it untouched. If the
 	 * window expires we fall through to the normal path and they are notified
 	 * then, exactly as before. */
-	if (ret == -ENETUNREACH && m_error_ctx.searching_retries < ON_ERROR_MAX_SEARCHING_RETRIES) {
+	/* Read once: the decision and the message it produces must describe the same
+	 * stat, and this is re-read on every re-check anyway. */
+	const enum ctr_lte_v2_cereg_param_stat stat = current_cereg_stat();
+
+	if (ret == -ENETUNREACH && m_error_ctx.searching_retries < ON_ERROR_MAX_SEARCHING_RETRIES &&
+	    cereg_stat_is_recoverable(stat)) {
 		m_error_ctx.searching_retries++;
 
-		LOG_WRN("Network searching (attempt %d/%d), re-checking in %d seconds",
-			m_error_ctx.searching_retries, ON_ERROR_MAX_SEARCHING_RETRIES,
-			ON_ERROR_SEARCHING_RETRY_S);
+		LOG_WRN("%s, waiting (attempt %d/%d), re-checking in %d seconds",
+			ctr_lte_v2_str_cereg_stat_human(stat), m_error_ctx.searching_retries,
+			ON_ERROR_MAX_SEARCHING_RETRIES, ON_ERROR_SEARCHING_RETRY_S);
 
 		/* Re-check in place rather than via on_timeout_state: transition_state()
 		 * into the state we are already in is a no-op, which would strand the
@@ -1040,10 +1087,14 @@ static int on_enter_error(void)
 	}
 
 	if (m_error_ctx.searching_retries) {
-		LOG_ERR("Flow check still failing (%d) after %d searching retries, "
-			"taking fallback action",
-			ret, m_error_ctx.searching_retries);
+		LOG_ERR("Flow check still failing (%d) after %d retries, taking fallback action", ret,
+			m_error_ctx.searching_retries);
 		m_error_ctx.searching_retries = 0;
+	} else if (ret == -ENETUNREACH) {
+		/* Terminal registration status -- say so, otherwise the escalation looks
+		 * identical to the recoverable case that simply ran out of retries. */
+		LOG_ERR("%s is not recoverable by waiting, taking fallback action",
+			ctr_lte_v2_str_cereg_stat_human(stat));
 	}
 
 	dispatch_consumers_on_offline();
