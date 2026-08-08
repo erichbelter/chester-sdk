@@ -24,4 +24,41 @@ config CTR_BUTTON_SHELL
 	default y
 	depends on SHELL
 
+config CTR_BUTTON_DWELL_MS
+	int "Level dwell required to accept a transition [ms]"
+	default 50
+	help
+	  How long a button line must hold its new level, uninterrupted, before
+	  the transition is accepted. Must be greater than
+	  CTR_BUTTON_COOLDOWN_MS, otherwise the interrupt is never re-armed in
+	  time to cancel a line that does not stay put and the debounce
+	  degenerates into a race. A human press lasts 80-300 ms; LTE-induced
+	  interference on the button nets follows the transmit envelope and
+	  rarely holds this long.
+
+config CTR_BUTTON_COOLDOWN_MS
+	int "Interrupt re-arm delay [ms]"
+	default 10
+	help
+	  How long after an edge the level interrupt is re-armed. The span
+	  between this and CTR_BUTTON_DWELL_MS is the window in which a
+	  wandering line gets its pending transition cancelled.
+
+config CTR_BUTTON_MAX_PLAUSIBLE_CLICKS
+	int "Reject click runs of this length or longer"
+	default 5
+	help
+	  Measured phantom click runs are bimodal - 1, or a runaway 14-32, with
+	  nothing in between - so a run this long is interference by
+	  construction. No hand produces it inside the 600 ms sliding window.
+
+config CTR_BUTTON_COINCIDENCE_MS
+	int "Cross-channel coincidence window [ms]"
+	default 100
+	help
+	  If both button channels see an edge within this window, both runs are
+	  discarded: a hand cannot press the on-board and the external button
+	  simultaneously, but interference reaches both through the adjacent
+	  module pins. Set to 0 to disable the rule.
+
 endif # CTR_BUTTON

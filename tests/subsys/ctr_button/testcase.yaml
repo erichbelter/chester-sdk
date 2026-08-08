@@ -1,0 +1,11 @@
+common:
+  tags:
+      - chester
+  platform_allow:
+    - native_posix
+    - qemu_cortex_m3
+  integration_platforms:
+    - native_posix
+
+tests:
+  subsys.ctr_button.policy: {}

@@ -8,6 +8,9 @@
 #include <chester/ctr_button.h>
 #include <chester/ctr_edge.h>
 
+/* Private includes */
+#include "ctr_button_policy.h"
+
 /* Zephyr includes */
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
@@ -27,6 +30,8 @@ static const struct gpio_dt_spec m_button_int = GPIO_DT_SPEC_GET(DT_ALIAS(sw0), 
 static const struct gpio_dt_spec m_button_ext = GPIO_DT_SPEC_GET(DT_ALIAS(sw1), gpios);
 
 #if defined(CONFIG_CTR_BUTTON_SHELL)
+static int cmd_button_stats(const struct shell *shell, size_t argc, char **argv);
+
 static int read_button(enum ctr_button_channel channel, bool *is_pressed)
 {
 	int ret;
@@ -108,6 +113,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	              "Read button state (format int|ext).",
 	              cmd_button_read, 2, 0),
 
+	SHELL_CMD_ARG(stats, NULL,
+	              "Show phantom-rejection counters (format [reset]).",
+	              cmd_button_stats, 1, 1),
+
 	SHELL_SUBCMD_SET_END
 );
 
@@ -128,6 +137,10 @@ struct button_data {
 	int click_count;
 	int64_t press_length;
 
+	/* Set when the opposite channel produced an edge inside the coincidence
+	 * window. The run is discarded when it completes rather than dispatched. */
+	bool poisoned;
+
 	struct k_work click_breakup_work;
 	struct k_work click_work;
 	struct k_work hold_work;
@@ -136,6 +149,9 @@ struct button_data {
 
 static struct button_data m_button_data_int = {0};
 static struct button_data m_button_data_ext = {0};
+
+/* Survives a warm reset on purpose - see ctr_button_policy.h. */
+static __noinit struct ctr_button_stats m_stats;
 
 static ctr_button_event_cb m_event_cb = NULL;
 static void *m_user_data = NULL;
@@ -149,9 +165,29 @@ static void click_breakup_work_handler(struct k_work *work)
 {
 	struct button_data *data = CONTAINER_OF(work, struct button_data, click_breakup_work);
 
-	m_event_cb(button_data_to_channel(data), CTR_BUTTON_EVENT_CLICK, data->click_count,
-		   m_user_data);
+	enum ctr_button_channel channel = button_data_to_channel(data);
+	int clicks = data->click_count;
+	bool poisoned = data->poisoned;
+
 	data->click_count = 0;
+	data->poisoned = false;
+
+	if (poisoned) {
+		LOG_WRN("Discarded %d click(s) on channel %d: cross-channel coincidence", clicks,
+			channel);
+		m_stats.rejected_coincid[channel]++;
+		return;
+	}
+
+	if (!ctr_button_policy_clicks_plausible(clicks, CONFIG_CTR_BUTTON_MAX_PLAUSIBLE_CLICKS)) {
+		LOG_WRN("Discarded %d click(s) on channel %d: implausible run", clicks, channel);
+		m_stats.rejected_burst[channel]++;
+		return;
+	}
+
+	m_stats.accepted[channel]++;
+
+	m_event_cb(channel, CTR_BUTTON_EVENT_CLICK, clicks, m_user_data);
 }
 
 static void click_breakup_timer_handler(struct k_timer *timer)
@@ -172,8 +208,18 @@ static void hold_work_handler(struct k_work *work)
 {
 	struct button_data *data = CONTAINER_OF(work, struct button_data, hold_work);
 
-	m_event_cb(button_data_to_channel(data), CTR_BUTTON_EVENT_HOLD, data->press_length,
-		   m_user_data);
+	enum ctr_button_channel channel = button_data_to_channel(data);
+
+	if (data->poisoned) {
+		data->poisoned = false;
+		LOG_WRN("Discarded hold on channel %d: cross-channel coincidence", channel);
+		m_stats.rejected_coincid[channel]++;
+		return;
+	}
+
+	m_stats.accepted[channel]++;
+
+	m_event_cb(channel, CTR_BUTTON_EVENT_HOLD, data->press_length, m_user_data);
 }
 
 static void edge_event_cb(struct ctr_edge *edge, enum ctr_edge_event event, void *user_data)
@@ -183,9 +229,21 @@ static void edge_event_cb(struct ctr_edge *edge, enum ctr_edge_event event, void
 	}
 
 	struct button_data *data = edge == &m_edge_int ? &m_button_data_int : &m_button_data_ext;
+	struct button_data *other =
+		data == &m_button_data_int ? &m_button_data_ext : &m_button_data_int;
 
 	int64_t uptime = k_uptime_get();
 	int64_t diff = uptime - data->last_event;
+
+	/* A hand cannot press the on-board and the external button at the same
+	 * instant; interference reaches both across the adjacent module pins.
+	 * Poison both runs - the one that reached the pin and the one it crossed
+	 * into - and let them be discarded when they complete. */
+	if (ctr_button_policy_is_coincident(uptime, other->last_event,
+					    CONFIG_CTR_BUTTON_COINCIDENCE_MS)) {
+		data->poisoned = true;
+		other->poisoned = true;
+	}
 
 	if (event == CTR_EDGE_EVENT_INACTIVE) {
 		if (diff > MIN_PRESS_LENGTH) {
@@ -222,11 +280,65 @@ int ctr_button_set_event_cb(ctr_button_event_cb cb, void *user_data)
 	return 0;
 }
 
+#if defined(CONFIG_CTR_BUTTON_SHELL)
+
+static int cmd_button_stats(const struct shell *shell, size_t argc, char **argv)
+{
+	if (argc == 2) {
+		if (strcmp(argv[1], "reset") != 0) {
+			shell_error(shell, "invalid argument: %s", argv[1]);
+			shell_help(shell);
+			return -EINVAL;
+		}
+
+		uint32_t boots = m_stats.boots;
+
+		memset(&m_stats, 0, sizeof(m_stats));
+		m_stats.magic = CTR_BUTTON_STATS_MAGIC;
+		m_stats.boots = boots;
+
+		ctr_edge_reset_stats(&m_edge_int);
+		ctr_edge_reset_stats(&m_edge_ext);
+
+		shell_print(shell, "counters cleared");
+
+		return 0;
+	}
+
+	uint32_t arm_int, cancel_int, arm_ext, cancel_ext;
+
+	ctr_edge_get_stats(&m_edge_int, &arm_int, &cancel_int);
+	ctr_edge_get_stats(&m_edge_ext, &arm_ext, &cancel_ext);
+
+	shell_print(shell, "dwell: %d ms  cooldown: %d ms  max clicks: %d  coincidence: %d ms",
+		    CONFIG_CTR_BUTTON_DWELL_MS, CONFIG_CTR_BUTTON_COOLDOWN_MS,
+		    CONFIG_CTR_BUTTON_MAX_PLAUSIBLE_CLICKS, CONFIG_CTR_BUTTON_COINCIDENCE_MS);
+	shell_print(shell, "boots since power-on: %u", m_stats.boots);
+	shell_print(shell, "                           int        ext");
+	/* Per-boot: how often anything crossed the input threshold at all, and
+	 * how often the dwell window threw it away. */
+	shell_print(shell, "arm (this boot):      %8u   %8u", arm_int, arm_ext);
+	shell_print(shell, "cancel (this boot):   %8u   %8u", cancel_int, cancel_ext);
+	/* Across reboots: what the button layer did about it. */
+	shell_print(shell, "accepted:             %8u   %8u", m_stats.accepted[0],
+		    m_stats.accepted[1]);
+	shell_print(shell, "rejected burst:       %8u   %8u", m_stats.rejected_burst[0],
+		    m_stats.rejected_burst[1]);
+	shell_print(shell, "rejected coincidence: %8u   %8u", m_stats.rejected_coincid[0],
+		    m_stats.rejected_coincid[1]);
+
+	return 0;
+}
+
+#endif /* defined(CONFIG_CTR_BUTTON_SHELL) */
+
 static int init(void)
 {
 	int ret;
 
 	LOG_INF("System initialization");
+
+	ctr_button_policy_stats_init(&m_stats);
 
 	if (!device_is_ready(m_button_int.port)) {
 		LOG_ERR("Device `BUTTON_INT` not ready");
@@ -271,19 +383,19 @@ static int init(void)
 		return ret;
 	}
 
-	ret = ctr_edge_set_cooldown_time(&m_edge_int, 10);
+	ret = ctr_edge_set_cooldown_time(&m_edge_int, CONFIG_CTR_BUTTON_COOLDOWN_MS);
 	if (ret) {
 		LOG_ERR("Call `ctr_edge_set_cooldown_time` (BUTTON_INT) failed: %d", ret);
 		return ret;
 	}
 
-	ret = ctr_edge_set_active_duration(&m_edge_int, 10);
+	ret = ctr_edge_set_active_duration(&m_edge_int, CONFIG_CTR_BUTTON_DWELL_MS);
 	if (ret) {
 		LOG_ERR("Call `ctr_edge_set_active_duration` (BUTTON_INT) failed: %d", ret);
 		return ret;
 	}
 
-	ret = ctr_edge_set_inactive_duration(&m_edge_int, 10);
+	ret = ctr_edge_set_inactive_duration(&m_edge_int, CONFIG_CTR_BUTTON_DWELL_MS);
 	if (ret) {
 		LOG_ERR("Call `ctr_edge_set_inactive_duration` (BUTTON_INT) failed: %d", ret);
 		return ret;
@@ -301,19 +413,19 @@ static int init(void)
 		return ret;
 	}
 
-	ret = ctr_edge_set_cooldown_time(&m_edge_ext, 10);
+	ret = ctr_edge_set_cooldown_time(&m_edge_ext, CONFIG_CTR_BUTTON_COOLDOWN_MS);
 	if (ret) {
 		LOG_ERR("Call `ctr_edge_set_cooldown_time` (BUTTON_EXT) failed: %d", ret);
 		return ret;
 	}
 
-	ret = ctr_edge_set_active_duration(&m_edge_ext, 10);
+	ret = ctr_edge_set_active_duration(&m_edge_ext, CONFIG_CTR_BUTTON_DWELL_MS);
 	if (ret) {
 		LOG_ERR("Call `ctr_edge_set_active_duration` (BUTTON_EXT) failed: %d", ret);
 		return ret;
 	}
 
-	ret = ctr_edge_set_inactive_duration(&m_edge_ext, 10);
+	ret = ctr_edge_set_inactive_duration(&m_edge_ext, CONFIG_CTR_BUTTON_DWELL_MS);
 	if (ret) {
 		LOG_ERR("Call `ctr_edge_set_inactive_duration` (BUTTON_EXT) failed: %d", ret);
 		return ret;

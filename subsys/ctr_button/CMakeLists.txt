@@ -7,3 +7,4 @@
 zephyr_library()
 
 zephyr_library_sources(ctr_button.c)
+zephyr_library_sources(ctr_button_policy.c)
