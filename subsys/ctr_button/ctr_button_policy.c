@@ -24,17 +24,3 @@ bool ctr_button_policy_clicks_plausible(int clicks, int max_plausible)
 	return clicks >= 1 && clicks < max_plausible;
 }
 
-bool ctr_button_policy_is_coincident(int64_t now_ms, int64_t other_last_ms, int window_ms)
-{
-	if (window_ms <= 0 || other_last_ms <= 0) {
-		return false;
-	}
-
-	int64_t diff = now_ms - other_last_ms;
-
-	if (diff < 0) {
-		diff = -diff;
-	}
-
-	return diff <= window_ms;
-}

@@ -45,33 +45,6 @@ ZTEST(ctr_button_policy, test_empty_run_is_not_a_press)
 	zassert_false(ctr_button_policy_clicks_plausible(-1, 5), NULL);
 }
 
-/* ---- cross-channel coincidence ---- */
-
-ZTEST(ctr_button_policy, test_simultaneous_channels_are_coincident)
-{
-	/* A hand cannot press S1 and the gland button in the same instant. */
-	zassert_true(ctr_button_policy_is_coincident(1000, 1000, 100), NULL);
-	zassert_true(ctr_button_policy_is_coincident(1099, 1000, 100), NULL);
-	zassert_true(ctr_button_policy_is_coincident(1100, 1000, 100), "the window is inclusive");
-}
-
-ZTEST(ctr_button_policy, test_separated_channels_are_not_coincident)
-{
-	zassert_false(ctr_button_policy_is_coincident(1101, 1000, 100), NULL);
-	zassert_false(ctr_button_policy_is_coincident(9000, 1000, 100), NULL);
-}
-
-ZTEST(ctr_button_policy, test_silent_other_channel_is_not_coincident)
-{
-	/* 0 means "that channel has never produced an edge since boot". */
-	zassert_false(ctr_button_policy_is_coincident(1000, 0, 100), NULL);
-}
-
-ZTEST(ctr_button_policy, test_zero_window_disables_the_rule)
-{
-	zassert_false(ctr_button_policy_is_coincident(1000, 1000, 0), NULL);
-}
-
 /* ---- persistent statistics ---- */
 
 ZTEST(ctr_button_policy, test_cold_boot_zeroes_garbage_stats)
@@ -88,8 +61,6 @@ ZTEST(ctr_button_policy, test_cold_boot_zeroes_garbage_stats)
 	zassert_equal(stats.accepted[1], 0, NULL);
 	zassert_equal(stats.rejected_burst[0], 0, NULL);
 	zassert_equal(stats.rejected_burst[1], 0, NULL);
-	zassert_equal(stats.rejected_coincid[0], 0, NULL);
-	zassert_equal(stats.rejected_coincid[1], 0, NULL);
 }
 
 ZTEST(ctr_button_policy, test_warm_reset_preserves_counts)
@@ -101,7 +72,6 @@ ZTEST(ctr_button_policy, test_warm_reset_preserves_counts)
 
 	stats.accepted[1] = 7;
 	stats.rejected_burst[0] = 3;
-	stats.rejected_coincid[1] = 11;
 
 	/* A reboot is this fault's own terminal symptom — the counts have to
 	 * survive it, or the detector erases its evidence exactly when the
@@ -111,7 +81,6 @@ ZTEST(ctr_button_policy, test_warm_reset_preserves_counts)
 	zassert_equal(stats.boots, 2, NULL);
 	zassert_equal(stats.accepted[1], 7, NULL);
 	zassert_equal(stats.rejected_burst[0], 3, NULL);
-	zassert_equal(stats.rejected_coincid[1], 11, NULL);
 }
 
 ZTEST_SUITE(ctr_button_policy, NULL, NULL, NULL, NULL, NULL);

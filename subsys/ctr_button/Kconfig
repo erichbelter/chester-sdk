@@ -52,13 +52,4 @@ config CTR_BUTTON_MAX_PLAUSIBLE_CLICKS
 	  nothing in between - so a run this long is interference by
 	  construction. No hand produces it inside the 600 ms sliding window.
 
-config CTR_BUTTON_COINCIDENCE_MS
-	int "Cross-channel coincidence window [ms]"
-	default 100
-	help
-	  If both button channels see an edge within this window, both runs are
-	  discarded: a hand cannot press the on-board and the external button
-	  simultaneously, but interference reaches both through the adjacent
-	  module pins. Set to 0 to disable the rule.
-
 endif # CTR_BUTTON
