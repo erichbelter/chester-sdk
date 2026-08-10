@@ -100,6 +100,8 @@ static void gpio_handler(const struct device *port, struct gpio_callback *cb, gp
 	struct ctr_edge *edge = CONTAINER_OF(cb, struct ctr_edge, gpio_cb);
 
 	if (atomic_set(&edge->is_debouncing, false)) {
+		atomic_inc(&edge->cancel_count);
+
 		k_timer_stop(&edge->event_timer);
 
 		gpio_flags_t level = atomic_get(&edge->is_active) ? GPIO_INT_LEVEL_INACTIVE
@@ -112,6 +114,8 @@ static void gpio_handler(const struct device *port, struct gpio_callback *cb, gp
 		}
 
 	} else {
+		atomic_inc(&edge->arm_count);
+
 		ret = gpio_pin_interrupt_configure_dt(edge->spec, GPIO_INT_DISABLE);
 		if (ret) {
 			LOG_ERR("Call `gpio_pin_interrupt_configure_dt` failed: %d", ret);
@@ -210,6 +214,22 @@ int ctr_edge_set_inactive_duration(struct ctr_edge *edge, int msec)
 	}
 
 	atomic_set(&edge->inactive_duration, msec);
+
+	return 0;
+}
+
+int ctr_edge_get_stats(struct ctr_edge *edge, uint32_t *arm_count, uint32_t *cancel_count)
+{
+	*arm_count = (uint32_t)atomic_get(&edge->arm_count);
+	*cancel_count = (uint32_t)atomic_get(&edge->cancel_count);
+
+	return 0;
+}
+
+int ctr_edge_reset_stats(struct ctr_edge *edge)
+{
+	atomic_set(&edge->arm_count, 0);
+	atomic_set(&edge->cancel_count, 0);
 
 	return 0;
 }

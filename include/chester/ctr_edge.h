@@ -48,6 +48,13 @@ struct ctr_edge {
 	struct gpio_callback gpio_cb;
 	atomic_t is_debouncing;
 	atomic_t is_active;
+	/* Diagnostics: how often the input buffer moved at all (`arm`) versus how
+	 * often the dwell window rejected what it saw (`cancel`). A disturbance
+	 * that fires the level interrupt but never survives the dwell produces no
+	 * event and is otherwise invisible. Per-boot only - this struct holds
+	 * kernel objects and cannot live in `.noinit`. */
+	atomic_t arm_count;
+	atomic_t cancel_count;
 };
 
 int ctr_edge_init(struct ctr_edge *edge, const struct gpio_dt_spec *spec, bool start_active);
@@ -56,6 +63,8 @@ int ctr_edge_set_callback(struct ctr_edge *edge, ctr_edge_cb_t cb, void *user_da
 int ctr_edge_set_cooldown_time(struct ctr_edge *edge, int msec);
 int ctr_edge_set_active_duration(struct ctr_edge *edge, int msec);
 int ctr_edge_set_inactive_duration(struct ctr_edge *edge, int msec);
+int ctr_edge_get_stats(struct ctr_edge *edge, uint32_t *arm_count, uint32_t *cancel_count);
+int ctr_edge_reset_stats(struct ctr_edge *edge);
 int ctr_edge_watch(struct ctr_edge *edge);
 int ctr_edge_unwatch(struct ctr_edge *edge);
 
