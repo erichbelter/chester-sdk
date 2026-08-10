@@ -126,6 +126,12 @@ SHELL_CMD_REGISTER(button, &sub_button, "Button commands.", print_help);
 
 #endif /* defined(CONFIG_CTR_BUTTON_SHELL) */
 
+/* ctr_edge only cancels a transition if the interrupt is re-armed (after the
+ * cooldown) before the dwell timer accepts it. With cooldown >= dwell the two
+ * expire together and the cancel path silently never runs. */
+BUILD_ASSERT(CONFIG_CTR_BUTTON_COOLDOWN_MS < CONFIG_CTR_BUTTON_DWELL_MS,
+	     "CTR_BUTTON_COOLDOWN_MS must be less than CTR_BUTTON_DWELL_MS");
+
 #define MAX_CLICK_PERIOD 600
 #define MIN_PRESS_LENGTH 1000
 
@@ -166,13 +172,27 @@ static void click_breakup_work_handler(struct k_work *work)
 
 	data->click_count = 0;
 
+	/* An implausible run is collapsed to a single click, not dropped.
+	 *
+	 * Dropping it removed the only way to wake a sleeping display: the touch
+	 * panel is powered down while asleep, so the external button is the sole
+	 * wake path, and every tap restarts the 600 ms breakup timer. A customer
+	 * who taps five times because nothing happened yet produced one run of 5,
+	 * which was discarded — the harder they pressed, the more certainly the
+	 * locker stayed dark.
+	 *
+	 * Nothing downstream depends on the count any more: the internal channel is
+	 * inert and the external one only wakes the display. Collapsing keeps the
+	 * user's intent while still refusing to let a 14-32 click EMI burst act as
+	 * a multi-click gesture. */
 	if (!ctr_button_policy_clicks_plausible(clicks, CONFIG_CTR_BUTTON_MAX_PLAUSIBLE_CLICKS)) {
-		LOG_WRN("Discarded %d click(s) on channel %d: implausible run", clicks, channel);
-		m_stats.rejected_burst[channel]++;
-		return;
+		LOG_WRN("Collapsed %d click(s) on channel %d to one: implausible run", clicks,
+			channel);
+		m_stats.clamped_burst[channel]++;
+		clicks = 1;
 	}
 
-	m_stats.accepted[channel]++;
+	m_stats.accepted_click[channel]++;
 
 	m_event_cb(channel, CTR_BUTTON_EVENT_CLICK, clicks, m_user_data);
 }
@@ -197,7 +217,7 @@ static void hold_work_handler(struct k_work *work)
 
 	enum ctr_button_channel channel = button_data_to_channel(data);
 
-	m_stats.accepted[channel]++;
+	m_stats.accepted_hold[channel]++;
 
 	m_event_cb(channel, CTR_BUTTON_EVENT_HOLD, data->press_length, m_user_data);
 }
@@ -289,10 +309,12 @@ static int cmd_button_stats(const struct shell *shell, size_t argc, char **argv)
 	shell_print(shell, "arm (this boot):      %8u   %8u", arm_int, arm_ext);
 	shell_print(shell, "cancel (this boot):   %8u   %8u", cancel_int, cancel_ext);
 	/* Across reboots: what the button layer did about it. */
-	shell_print(shell, "accepted:             %8u   %8u", m_stats.accepted[0],
-		    m_stats.accepted[1]);
-	shell_print(shell, "rejected burst:       %8u   %8u", m_stats.rejected_burst[0],
-		    m_stats.rejected_burst[1]);
+	shell_print(shell, "clicks dispatched:    %8u   %8u", m_stats.accepted_click[0],
+		    m_stats.accepted_click[1]);
+	shell_print(shell, "holds dispatched:     %8u   %8u", m_stats.accepted_hold[0],
+		    m_stats.accepted_hold[1]);
+	shell_print(shell, "bursts collapsed:     %8u   %8u", m_stats.clamped_burst[0],
+		    m_stats.clamped_burst[1]);
 
 	return 0;
 }

@@ -57,10 +57,12 @@ ZTEST(ctr_button_policy, test_cold_boot_zeroes_garbage_stats)
 
 	zassert_equal(stats.magic, CTR_BUTTON_STATS_MAGIC, NULL);
 	zassert_equal(stats.boots, 1, "the first boot counts as one");
-	zassert_equal(stats.accepted[0], 0, NULL);
-	zassert_equal(stats.accepted[1], 0, NULL);
-	zassert_equal(stats.rejected_burst[0], 0, NULL);
-	zassert_equal(stats.rejected_burst[1], 0, NULL);
+	zassert_equal(stats.accepted_click[0], 0, NULL);
+	zassert_equal(stats.accepted_click[1], 0, NULL);
+	zassert_equal(stats.accepted_hold[0], 0, NULL);
+	zassert_equal(stats.accepted_hold[1], 0, NULL);
+	zassert_equal(stats.clamped_burst[0], 0, NULL);
+	zassert_equal(stats.clamped_burst[1], 0, NULL);
 }
 
 ZTEST(ctr_button_policy, test_warm_reset_preserves_counts)
@@ -70,8 +72,8 @@ ZTEST(ctr_button_policy, test_warm_reset_preserves_counts)
 	memset(&stats, 0xA5, sizeof(stats));
 	ctr_button_policy_stats_init(&stats);
 
-	stats.accepted[1] = 7;
-	stats.rejected_burst[0] = 3;
+	stats.accepted_click[1] = 7;
+	stats.clamped_burst[0] = 3;
 
 	/* A reboot is this fault's own terminal symptom — the counts have to
 	 * survive it, or the detector erases its evidence exactly when the
@@ -79,8 +81,8 @@ ZTEST(ctr_button_policy, test_warm_reset_preserves_counts)
 	ctr_button_policy_stats_init(&stats);
 
 	zassert_equal(stats.boots, 2, NULL);
-	zassert_equal(stats.accepted[1], 7, NULL);
-	zassert_equal(stats.rejected_burst[0], 3, NULL);
+	zassert_equal(stats.accepted_click[1], 7, NULL);
+	zassert_equal(stats.clamped_burst[0], 3, NULL);
 }
 
 ZTEST_SUITE(ctr_button_policy, NULL, NULL, NULL, NULL, NULL);
