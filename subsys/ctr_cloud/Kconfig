@@ -6,7 +6,7 @@
 
 config CTR_CLOUD
 	bool "CTR_CLOUD"
-	depends on SHIELD_CTR_LTE_V2
+	depends on SHIELD_CTR_LTE_V2 || NET_L2_ETHERNET
 	select CTR_BUF
 	select CTR_INFO
 	select CTR_RTC
@@ -29,9 +29,40 @@ config SHELL_BACKEND_DUMMY_BUF_SIZE
 	int "SHELL_BACKEND_DUMMY_BUF_SIZE"
 	default 8192
 
-# Temporary: replaced by a proper transport choice in the next commit.
+choice CTR_CLOUD_TRANSPORT
+	prompt "Cloud transport"
+	default CTR_CLOUD_TRANSPORT_LTE if SHIELD_CTR_LTE_V2
+	default CTR_CLOUD_TRANSPORT_SOCKET
+
 config CTR_CLOUD_TRANSPORT_LTE
-	bool
-	default y
+	bool "Cellular (ctr_lte_v2)"
+	depends on SHIELD_CTR_LTE_V2
+
+config CTR_CLOUD_TRANSPORT_SOCKET
+	bool "IP socket"
+	depends on NETWORKING
+	select NET_SOCKETS
+	select NET_UDP
+	select DNS_RESOLVER
+	# SO_RCVTIMEO is compiled out without this; the transport would then
+	# block forever on recv instead of timing out. Not optional.
+	select NET_CONTEXT_RCVTIMEO
+
+endchoice
+
+if CTR_CLOUD_TRANSPORT_SOCKET
+
+config CTR_CLOUD_SOCKET_HOST
+	string "HARDWARIO Cloud host"
+	default "157.245.24.13"
+	help
+	  Hostname or dotted-quad address of the cloud ingress. The default is
+	  the public ingress, used when the device is not on a private APN.
+
+config CTR_CLOUD_SOCKET_PORT
+	int "HARDWARIO Cloud UDP port"
+	default 5003
+
+endif # CTR_CLOUD_TRANSPORT_SOCKET
 
 endif # CTR_CLOUD

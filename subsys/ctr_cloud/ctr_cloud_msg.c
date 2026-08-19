@@ -27,7 +27,9 @@
 /* CHESTER includes */
 #include <chester/ctr_buf.h>
 #include <chester/ctr_info.h>
+#if defined(CONFIG_CTR_CLOUD_TRANSPORT_LTE)
 #include <chester/ctr_lte_v2.h>
+#endif
 #include <chester/drivers/ctr_z.h>
 #include <zcbor_common.h>
 #include <zcbor_decode.h>
@@ -183,6 +185,11 @@ int ctr_cloud_msg_pack_create_session(struct ctr_buf *buf)
 	zcbor_uint32_put(zs, UL_SESSION_KEY_BLE_PASSKEY);
 	zcbor_tstr_put_term(zs, ble_passkey, CONFIG_ZCBOR_MAX_STR_LEN);
 
+#if defined(CONFIG_CTR_CLOUD_TRANSPORT_LTE)
+	/* Cellular identity. Omitted entirely on a non-cellular transport: there
+	 * is no modem to read, and reporting a fabricated IMEI would corrupt the
+	 * cloud's device record. See BET-199 - whether the cloud accepts a
+	 * session without these keys is resolved on the bench. */
 	uint64_t imei;
 	ret = ctr_lte_v2_get_imei(&imei);
 	if (ret) {
@@ -209,6 +216,7 @@ int ctr_cloud_msg_pack_create_session(struct ctr_buf *buf)
 
 	zcbor_uint32_put(zs, UL_SESSION_KEY_LTE_FW_VERSION);
 	zcbor_tstr_put_term(zs, modem_fw_version, CONFIG_ZCBOR_MAX_STR_LEN);
+#endif /* defined(CONFIG_CTR_CLOUD_TRANSPORT_LTE) */
 
 #if defined(CONFIG_SHIELD_CTR_Z)
 
@@ -448,6 +456,8 @@ int ctr_cloud_msg_pack_stats(struct ctr_buf *buf)
 	zcbor_uint32_put(zs, UL_STATS_KEY_UPTIME);
 	zcbor_uint64_put(zs, k_uptime_get() / 1000);
 
+#if defined(CONFIG_CTR_CLOUD_TRANSPORT_LTE)
+	/* Radio link quality has no meaning on a wired transport. */
 	struct ctr_lte_v2_conn_param param;
 	ret = ctr_lte_v2_get_conn_param(&param);
 	if (ret) {
@@ -483,6 +493,7 @@ int ctr_cloud_msg_pack_stats(struct ctr_buf *buf)
 		zcbor_uint32_put(zs, UL_STATS_KEY_NETWORK_EARFCN);
 		zcbor_int32_put(zs, param.earfcn);
 	}
+#endif /* defined(CONFIG_CTR_CLOUD_TRANSPORT_LTE) */
 
 	zcbor_map_end_encode(zs, ZCBOR_VALUE_IS_INDEFINITE_LENGTH);
 
