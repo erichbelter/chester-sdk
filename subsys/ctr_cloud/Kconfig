@@ -29,4 +29,9 @@ config SHELL_BACKEND_DUMMY_BUF_SIZE
 	int "SHELL_BACKEND_DUMMY_BUF_SIZE"
 	default 8192
 
+# Temporary: replaced by a proper transport choice in the next commit.
+config CTR_CLOUD_TRANSPORT_LTE
+	bool
+	default y
+
 endif # CTR_CLOUD
