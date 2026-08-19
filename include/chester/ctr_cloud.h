@@ -17,7 +17,10 @@
 extern "C" {
 #endif
 
-#define CTR_CLOUD_TRANSFER_BUF_SIZE (16 * 1024)
+/* Sized by Kconfig: a wired node does not fragment over UDP the way a
+ * cellular node does and can run a much smaller staging buffer. The default
+ * is unchanged at 16 KiB, so no existing application is affected. */
+#define CTR_CLOUD_TRANSFER_BUF_SIZE CONFIG_CTR_CLOUD_TRANSFER_BUF_SIZE
 
 /**
  * @brief Cloud communication metrics.

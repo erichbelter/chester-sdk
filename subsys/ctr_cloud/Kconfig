@@ -29,6 +29,14 @@ config SHELL_BACKEND_DUMMY_BUF_SIZE
 	int "SHELL_BACKEND_DUMMY_BUF_SIZE"
 	default 8192
 
+config CTR_CLOUD_TRANSFER_BUF_SIZE
+	int "Cloud transfer buffer size in bytes"
+	default 16384
+	help
+	  Staging buffer for one cloud message before fragmentation. 16 KiB is
+	  the historical default. A wired node can run much smaller; 8 KiB was
+	  used on the BET-199 Ethernet PoC.
+
 choice CTR_CLOUD_TRANSPORT
 	prompt "Cloud transport"
 	default CTR_CLOUD_TRANSPORT_LTE if SHIELD_CTR_LTE_V2
