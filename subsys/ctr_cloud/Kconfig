@@ -71,6 +71,15 @@ config CTR_CLOUD_SOCKET_PORT
 	int "HARDWARIO Cloud UDP port"
 	default 5003
 
+config CTR_CLOUD_SOCKET_MAX_RECV_MS
+	int "Maximum receive wait in milliseconds"
+	default 30000
+	help
+	  Upper bound on how long one datagram exchange waits for a reply.
+	  ctr_cloud passes K_FOREVER while holding its own lock, so an unbounded
+	  wait on a lost UDP datagram would wedge the whole cloud subsystem.
+	  Any caller timeout longer than this, or K_FOREVER, is clamped here.
+
 endif # CTR_CLOUD_TRANSPORT_SOCKET
 
 endif # CTR_CLOUD

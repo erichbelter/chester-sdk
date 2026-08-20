@@ -76,7 +76,27 @@ int ctr_cloud_transport_send_recv(const uint8_t *send_buf, size_t send_len, uint
 		return -errno;
 	}
 
-	int64_t ms = k_ticks_to_ms_floor64(timeout.ticks);
+	/* ctr_cloud calls the transport with K_FOREVER (ctr_cloud.c:319) while
+	 * holding its own m_lock. Converting that arithmetically is wrong -
+	 * K_FOREVER.ticks is (k_ticks_t)-1 - and a recv that never returns wedges
+	 * the entire cloud subsystem: every later poll then fails with
+	 * "Failed to acquire lock: -11". Observed on the bench 2026-08-19.
+	 *
+	 * Bound it instead. On UDP, a datagram that has not arrived within this
+	 * window is lost, and the caller's own retry is the correct recovery -
+	 * blocking forever waiting for it never is. */
+	int64_t ms;
+
+	if (K_TIMEOUT_EQ(timeout, K_FOREVER)) {
+		ms = CONFIG_CTR_CLOUD_SOCKET_MAX_RECV_MS;
+	} else {
+		ms = k_ticks_to_ms_floor64(timeout.ticks);
+	}
+
+	if (ms <= 0 || ms > CONFIG_CTR_CLOUD_SOCKET_MAX_RECV_MS) {
+		ms = CONFIG_CTR_CLOUD_SOCKET_MAX_RECV_MS;
+	}
+
 	struct zsock_timeval tv = {
 		.tv_sec = (uint32_t)(ms / 1000),
 		.tv_usec = (uint32_t)((ms % 1000) * 1000),
