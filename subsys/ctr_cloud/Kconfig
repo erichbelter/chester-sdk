@@ -6,7 +6,7 @@
 
 config CTR_CLOUD
 	bool "CTR_CLOUD"
-	depends on SHIELD_CTR_LTE_V2
+	depends on SHIELD_CTR_LTE_V2 || NET_L2_ETHERNET
 	select CTR_BUF
 	select CTR_INFO
 	select CTR_RTC
@@ -28,5 +28,58 @@ source "subsys/logging/Kconfig.template.log_config"
 config SHELL_BACKEND_DUMMY_BUF_SIZE
 	int "SHELL_BACKEND_DUMMY_BUF_SIZE"
 	default 8192
+
+config CTR_CLOUD_TRANSFER_BUF_SIZE
+	int "Cloud transfer buffer size in bytes"
+	default 16384
+	help
+	  Staging buffer for one cloud message before fragmentation. 16 KiB is
+	  the historical default. A wired node can run much smaller; 8 KiB was
+	  used on the BET-199 Ethernet PoC.
+
+choice CTR_CLOUD_TRANSPORT
+	prompt "Cloud transport"
+	default CTR_CLOUD_TRANSPORT_LTE if SHIELD_CTR_LTE_V2
+	default CTR_CLOUD_TRANSPORT_SOCKET
+
+config CTR_CLOUD_TRANSPORT_LTE
+	bool "Cellular (ctr_lte_v2)"
+	depends on SHIELD_CTR_LTE_V2
+
+config CTR_CLOUD_TRANSPORT_SOCKET
+	bool "IP socket"
+	depends on NETWORKING
+	select NET_SOCKETS
+	select NET_UDP
+	select DNS_RESOLVER
+	# SO_RCVTIMEO is compiled out without this; the transport would then
+	# block forever on recv instead of timing out. Not optional.
+	select NET_CONTEXT_RCVTIMEO
+
+endchoice
+
+if CTR_CLOUD_TRANSPORT_SOCKET
+
+config CTR_CLOUD_SOCKET_HOST
+	string "HARDWARIO Cloud host"
+	default "157.245.24.13"
+	help
+	  Hostname or dotted-quad address of the cloud ingress. The default is
+	  the public ingress, used when the device is not on a private APN.
+
+config CTR_CLOUD_SOCKET_PORT
+	int "HARDWARIO Cloud UDP port"
+	default 5003
+
+config CTR_CLOUD_SOCKET_MAX_RECV_MS
+	int "Maximum receive wait in milliseconds"
+	default 30000
+	help
+	  Upper bound on how long one datagram exchange waits for a reply.
+	  ctr_cloud passes K_FOREVER while holding its own lock, so an unbounded
+	  wait on a lost UDP datagram would wedge the whole cloud subsystem.
+	  Any caller timeout longer than this, or K_FOREVER, is clamped here.
+
+endif # CTR_CLOUD_TRANSPORT_SOCKET
 
 endif # CTR_CLOUD

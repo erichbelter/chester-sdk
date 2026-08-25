@@ -6,12 +6,12 @@
 
 #include "ctr_cloud_packet.h"
 #include "ctr_cloud_transfer.h"
+#include "ctr_cloud_transport.h"
 
 /* CHESTER includes */
 #include <chester/ctr_buf.h>
 #include <chester/ctr_cloud.h>
 #include <chester/ctr_info.h>
-#include <chester/ctr_lte_v2.h>
 #include <chester/ctr_rtc.h>
 
 /* Zephyr includes */
@@ -77,26 +77,19 @@ static int transfer(struct ctr_cloud_packet *pck_send, struct ctr_cloud_packet *
 	LOG_HEXDUMP_INF(ctr_buf_get_mem(send_buf), ctr_buf_get_used(send_buf),
 			rai ? "Sending packet RAI:" : "Sending packet:");
 
-	struct ctr_lte_v2_send_recv_param param = {
-		.rai = rai,
-		.send_as_string = true,
-		.send_buf = ctr_buf_get_mem(send_buf),
-		.send_len = ctr_buf_get_used(send_buf),
-		.recv_buf = NULL,
-		.recv_size = 0,
-		.recv_len = &len,
-		.timeout = timeout,
-	};
+	uint8_t *rx_mem = NULL;
+	size_t rx_size = 0;
 
 	if (pck_recv) {
 		ctr_buf_reset(recv_buf);
-		param.recv_buf = ctr_buf_get_mem(recv_buf);
-		param.recv_size = ctr_buf_get_free(recv_buf);
+		rx_mem = ctr_buf_get_mem(recv_buf);
+		rx_size = ctr_buf_get_free(recv_buf);
 	}
 
-	ret = ctr_lte_v2_send_recv(&param);
+	ret = ctr_cloud_transport_send_recv(ctr_buf_get_mem(send_buf), ctr_buf_get_used(send_buf),
+					    rx_mem, rx_size, &len, rai, timeout);
 	if (ret) {
-		LOG_ERR("Call `ctr_lte_v2_send_recv` failed: %d", ret);
+		LOG_ERR("Call `ctr_cloud_transport_send_recv` failed: %d", ret);
 		return ret;
 	}
 
@@ -153,7 +146,7 @@ int ctr_cloud_transfer_init(uint32_t serial_number, uint8_t token[16], ctr_cloud
 
 	m_cb = cb;
 
-	ctr_lte_v2_enable();
+	ctr_cloud_transport_enable();
 
 	return 0;
 }
@@ -162,9 +155,9 @@ int ctr_cloud_transfer_wait_for_ready(k_timeout_t timeout)
 {
 	int ret;
 
-	ret = ctr_lte_v2_wait_for_connected(timeout);
+	ret = ctr_cloud_transport_wait_for_ready(timeout);
 	if (ret) {
-		LOG_ERR("Call `ctr_lte_v2_wait_for_connected` failed: %d", ret);
+		LOG_ERR("Call `ctr_cloud_transport_wait_for_ready` failed: %d", ret);
 		return ret;
 	}
 
